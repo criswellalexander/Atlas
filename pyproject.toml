@@ -48,7 +48,8 @@ notebooks = [
 # astro.py for SobolEngine during offline training-set generation and must
 # never be reachable at sampling time.
 experimental = [
-    "dm-haiku",
+    "dm-haiku",       # flows.py
+    "flax>=0.12",     # flax_flows.py (NNX modules as pytrees)
     "distrax",
     "optax",
     "torch",
@@ -59,6 +60,10 @@ include = ["ATLAS*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# The golden run is a full sampling fit (minutes on a GPU, far longer on CPU),
+# so it runs only when asked: `pytest -m golden`. A -m on the command line
+# replaces this one.
+addopts = "-m 'not golden'"
 markers = [
     "slow: takes more than a few seconds",
     "gpu: needs a GPU",
