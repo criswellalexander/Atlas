@@ -20,7 +20,6 @@ methods, same power-affine normalisation.  Differences from ``flows.py``:
 - ``save_params`` writes parameters keyed by their path in the module tree;
   ``load_params`` rejects files from the Haiku version (retrain instead).
 
-This module does not import haiku.
 """
 
 import os
@@ -42,7 +41,7 @@ jax.config.update("jax_enable_x64", True)
 _PARAMS_FORMAT = "atlas-flax-nnx-v1"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Normalisation helpers (copied from flows.py so this module stays haiku-free)
+# Normalisation helpers 
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _fit_normalizer(min_x, max_x, p, B):
@@ -129,7 +128,7 @@ def _logdet_to_coefficients_jnp(arr, alpha, mean, half_range, B):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Memmapped-safe batch iterator (copied from flows.py)
+# Memmapped-safe batch iterator
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _iter_batches(data, context, x_norm, c_norm, batch_size, key):
