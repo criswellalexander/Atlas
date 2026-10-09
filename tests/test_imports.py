@@ -85,6 +85,26 @@ def test_core_imports_without(blocked):
         f"blocking {blocked} broke the core:\n{r.stdout}\n{r.stderr[-2000:]}")
 
 
+def test_astro_imports_without_its_extra():
+    """ATLAS.experimental.astro imports holodeck and h5py lazily, so the module
+    loads without the [astro] extra (and never needs torch)."""
+    r = _import_with_blocked(("holodeck", "h5py", "torch"),
+                             mods=["ATLAS.experimental.astro"])
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr[-2000:]}"
+
+
+def test_import_does_not_initialize_a_device():
+    """Importing ATLAS must not start a JAX backend. joblib workers import
+    ATLAS.experimental.astro just to unpickle their task; if the import
+    created an array, each worker would claim the GPU."""
+    code = ("import ATLAS.experimental.astro\n"
+            "from jax._src import xla_bridge\n"
+            "assert not xla_bridge._backends, list(xla_bridge._backends)\n")
+    r = subprocess.run([sys.executable, "-c", code], cwd=str(ROOT),
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-2000:]
+
+
 def test_pulsar_module_is_the_one_that_needs_them():
     """Stated as a fact rather than assumed: ATLAS.pulsar is where the
     unpip-installable dependencies live, and it is never on the test path."""
