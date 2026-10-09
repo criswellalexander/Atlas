@@ -5,8 +5,9 @@ This module will hold everything needed to go from an astrophysical population
 model to a GWB likelihood term:
 
 1. Training-set generation: holodeck SAM draws converted to free-spectrum
-   amplitudes ``log10_rho`` (this section).
-2. Conditional normalizing-flow training on those sets (Stage 1b).
+   amplitudes ``log10_rho``.
+2. Conditional normalizing-flow training on those sets
+   (:func:`train_astro_flow`; the flows live in ``zuko_flows.py``).
 3. The hierarchical PTA model and sampling (Stage 1c).
 
 Training sets
@@ -81,6 +82,7 @@ __all__ = [
     "combine_training_set",
     "load_holodeck_library",
     "TrainingSet",
+    "train_astro_flow",
 ]
 
 PARAMS_FILE = "test_astro_params.npy"
@@ -586,9 +588,16 @@ class TrainingSet:
         half_range = (max_x - min_x) / 2
         return dict(B=B, mean=mean, half_range=half_range)
 
-    def normalize(self, B=5):
+    def normalize(self, B=5, mapping=None):
         """
         Map to ``[-B, B]`` in memory.
+
+        Parameters
+        ----------
+        B : float
+        mapping : dict, optional
+            Use this mapping (e.g. the full set's, for a split) instead of
+            computing one from this set; ``B`` is then taken from it.
 
         Returns
         -------
@@ -597,7 +606,8 @@ class TrainingSet:
         mapping : dict
             See :meth:`normalization`.
         """
-        mapping = self.normalization(B)
+        mapping = self.normalization(B) if mapping is None else mapping
+        B = mapping["B"]
         p = self.n_params
         mean, half = mapping["mean"], mapping["half_range"]
         rho_norm = B * (np.asarray(self.log10_rho) - mean[p:]) / half[p:]
@@ -633,6 +643,130 @@ class TrainingSet:
         np.savez_compressed(os.path.join(save_dir, f"gwb_spectrum_samples_{tag}_mapping_data.npy"),
                             B=B, mean=mean, half_range=half)
         return mapping
+
+    # ---- train / validation split (DataSplitter) ---------------------------------
+
+    def split(self, n_val_draws, n_val_real, seeds=(0, 1)):
+        """
+        Hold out a validation set, as Pandora's ``DataSplitter`` does.
+
+        ``n_val_draws`` parameter draws and ``n_val_real`` realizations are
+        chosen at random; the validation set is their cross product, and the
+        training set is everything outside both (so the two share neither
+        draws nor realizations). Reproduces ``DataSplitter.splitter_mesh`` on
+        ``log10_rho`` and ``DataSplitter.splitter`` on ``params`` given the
+        same seeds.
+
+        Parameters
+        ----------
+        n_val_draws, n_val_real : int
+        seeds : (int, int)
+            Seeds for the draw and realization choices.
+
+        Returns
+        -------
+        train, val : TrainingSet
+            Validation rows follow the random draw order, as in Pandora.
+        """
+        import random
+
+        v0 = random.Random(seeds[0]).sample(range(self.n_draws), k=n_val_draws)
+        v1 = random.Random(seeds[1]).sample(range(self.n_real), k=n_val_real)
+        keep0 = np.ones(self.n_draws, dtype=bool)
+        keep0[v0] = False
+        keep1 = np.ones(self.n_real, dtype=bool)
+        keep1[v1] = False
+
+        def subset(rows, rho):
+            return TrainingSet(params=self.params[rows], log10_rho=rho,
+                               param_names=list(self.param_names), f_conv=self.f_conv,
+                               tspan=self.tspan, draw_indices=self.draw_indices[rows],
+                               metadata=dict(self.metadata))
+
+        rho = self.log10_rho
+        train = subset(keep0, rho[np.ix_(keep0, keep1)])
+        val = subset(v0, rho[np.ix_(v0, v1)])
+        return train, val
+
+
+def train_astro_flow(training_set, save_dir, nf_type="rho|theta", B=5, val=None,
+                     split_seeds=(0, 1), steps=10_000, batch_size=512, save_freq=1_000,
+                     mode="diagonal", device=None, spline_bins=8, hidden_dims=(512, 512),
+                     transforms=3, train_kwargs=None):
+    """
+    Train a conditional flow on a training set (Pandora's full training path).
+
+    Normalizes ``training_set`` to ``[-B, B]`` (the same map Pandora saves in
+    ``*_mapping_data.npy.npz``), optionally holds out a validation set for
+    Hellinger-distance early stopping, trains a zuko NSF, and saves it.
+
+    Parameters
+    ----------
+    training_set : TrainingSet
+    save_dir : str
+        Receives checkpoints, ``flow_config.json`` and the final
+        ``flow_state.pt``; reload with ``ZukoAstroFlow.load(save_dir)``.
+    nf_type : {'rho|theta', 'theta|rho', 'rho'}
+    B : float
+    val : (n_val_draws, n_val_real) or None
+        Validation split (see :meth:`TrainingSet.split`). Not available for
+        ``'theta|rho'``.
+    split_seeds : (int, int)
+    steps, batch_size, save_freq, mode
+        See ``zuko_flows.FlowTrainer.train``. ``mode='flat'`` reproduces the
+        loop in ``AstroInferenceUpdated.ipynb``.
+    device, spline_bins, hidden_dims, transforms
+        See ``zuko_flows.FlowTrainer``. The notebook uses
+        ``hidden_dims=[512] * 8``.
+    train_kwargs : dict, optional
+        Further ``FlowTrainer.train`` arguments (``learning_rate``, ``seed``,
+        ``patience``, ...).
+
+    Returns
+    -------
+    flow : zuko_flows.ZukoAstroFlow
+    history : dict
+    """
+    from ATLAS.experimental import zuko_flows as zf
+
+    if nf_type not in zf.NF_TYPES:
+        raise ValueError(f"nf_type must be one of {zf.NF_TYPES}, got {nf_type!r}")
+    mapping = training_set.normalization(B)
+    if val is not None:
+        if nf_type == "theta|rho":
+            raise ValueError("validation is only available for 'rho|theta' and 'rho' flows")
+        train_set, val_set = training_set.split(*val, seeds=split_seeds)
+    else:
+        train_set, val_set = training_set, None
+
+    rho_n, ast_n, _ = train_set.normalize(mapping=mapping)
+    inputs, context = {"rho|theta": (rho_n, ast_n), "theta|rho": (ast_n, rho_n),
+                       "rho": (rho_n, None)}[nf_type]
+
+    validation = None
+    if val_set is not None:
+        v_rho, v_ast, _ = val_set.normalize(mapping=mapping)
+        if nf_type == "rho|theta":
+            # (n_ctx, n_val_real, n_f) -> (n_ctx * n_f, n_val_real), Pandora's layout
+            validation = (v_rho.transpose(0, 2, 1).reshape(-1, v_rho.shape[1]), v_ast)
+        else:
+            # unconditional: all held-out samples of each frequency, (n_f, n)
+            validation = (v_rho.reshape(-1, v_rho.shape[-1]).T, None)
+
+    metadata = dict(nf_type=nf_type, n_params=training_set.n_params, mapping=mapping,
+                    param_names=list(training_set.param_names),
+                    f_conv=None if training_set.f_conv is None else list(training_set.f_conv),
+                    tspan=training_set.tspan)
+    trainer = zf.FlowTrainer(inputs, context, save_dir, B, device=device,
+                             spline_bins=spline_bins, hidden_dims=hidden_dims,
+                             transforms=transforms, metadata=metadata)
+    history = trainer.train(steps, batch_size, save_freq, mode=mode, validation=validation,
+                            **(train_kwargs or {}))
+    flow = zf.ZukoAstroFlow(trainer.flow, nf_type, mapping, training_set.n_params,
+                            device=trainer.device,
+                            metadata={k: metadata[k] for k in ("param_names", "f_conv", "tspan")})
+    flow.save(save_dir)
+    return flow, history
 
 
 def load_holodeck_library(path, n_freqs, tspan=None, freqs=None, hc_floor=1e-20):

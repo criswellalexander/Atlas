@@ -86,9 +86,9 @@ def test_core_imports_without(blocked):
 
 
 def test_astro_imports_without_its_extra():
-    """ATLAS.experimental.astro imports holodeck and h5py lazily, so the module
-    loads without the [astro] extra (and never needs torch)."""
-    r = _import_with_blocked(("holodeck", "h5py", "torch"),
+    """ATLAS.experimental.astro imports holodeck, h5py and the zuko flows
+    lazily, so the module loads without the [astro] extra."""
+    r = _import_with_blocked(("holodeck", "h5py", "torch", "zuko"),
                              mods=["ATLAS.experimental.astro"])
     assert r.returncode == 0, f"{r.stdout}\n{r.stderr[-2000:]}"
 
