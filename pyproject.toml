@@ -45,7 +45,7 @@ notebooks = [
 
 # ATLAS/experimental/: the normalising-flow and SMBH-population code that
 # Stage 7 of the development plan will promote back. `torch` is used only by
-# astro.py for SobolEngine during offline training-set generation and must
+# cw_astro.py for SobolEngine during offline training-set generation and must
 # never be reachable at sampling time.
 experimental = [
     "dm-haiku",       # flows.py
@@ -53,6 +53,23 @@ experimental = [
     "distrax",
     "optax",
     "torch",
+]
+
+# ATLAS/experimental/astro.py and zuko_flows.py: hierarchical astrophysical
+# inference of the GWB (ported from Pandora). holodeck simulates the training
+# sets; h5py reads holodeck librarian libraries; torch and zuko train the
+# flows (zuko_flows.py); PTMCMCSampler samples the hierarchical posterior;
+# flax, optax and distrax build and train the differentiable flows
+# (flax_flows.py).
+astro = [
+    "holodeck-gw",
+    "h5py",
+    "torch",
+    "zuko",
+    "ptmcmcsampler",
+    "flax",
+    "optax",
+    "distrax",
 ]
 
 [tool.setuptools.packages.find]
@@ -69,4 +86,5 @@ markers = [
     "gpu: needs a GPU",
     "golden: full sampling run checked against a recorded posterior",
     "needs_data: reads par/tim files, so needs PINT or tempo2",
+    "astro: needs the [astro] extra (holodeck)",
 ]
