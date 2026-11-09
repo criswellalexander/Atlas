@@ -1,0 +1,757 @@
+"""
+Training sets for the astrophysical GWB flows: holodeck SAM draws converted to
+free-spectrum amplitudes ``log10_rho`` (ported from Pandora).
+
+Flows are trained on these sets with ``ATLAS.astro.flows.train`` and used for
+inference in ``ATLAS.astro.inference``.
+
+Training sets
+-------------
+Pandora generates training sets in ``examples/AstroInferenceUpdated.ipynb``.
+The functions here follow that notebook closely enough to reproduce its output
+bit for bit, given the same parameter draws and the same RNG seed:
+
+* Latin-hypercube draws of the astrophysical parameters come from a holodeck
+  ``_Param_Space``. Any holodeck parameter space works, and
+  :func:`pandora_phenom_param_space` builds the 6-parameter "phenom" space
+  that Pandora uses.
+* Each draw runs ``sam.gwb_new`` and converts the characteristic strain to
+  ``log10_rho = 0.5 * log10(hc^2 / (12 pi^2 f^3 T))``, which is the
+  ``halflog10_rho`` / enterprise ``log10_rho`` convention.
+* Files on disk use Pandora's names and layouts, so Pandora training sets and
+  Atlas training sets can be used interchangeably:
+
+  ========================================================  ===================
+  ``test_astro_params.npy``                                  (n_draws, n_pars)
+  ``{i}_{tag}.npy``                                          (n_f, n_real)
+  ``gwb_spectrum_samples_{tag}.npy``                         (n_kept, n_real, n_f)
+  ``gwb_spectrum_samples_{tag}_normalized.npy``              (n_kept, n_real, n_f)
+  ``ast_spectrum_samples_{tag}_normalized.npy``              (n_kept, n_pars)
+  ``gwb_spectrum_samples_{tag}_mapping_data.npy.npz``        B, mean, half_range
+  ========================================================  ===================
+
+  Atlas also writes ``trainset_{tag}_metadata.json``, which records how the
+  set was made.
+
+Differences from Pandora
+------------------------
+* Draws can be seeded. holodeck builds an unseeded ``PCG64()`` for every
+  ``gwb_new`` call, so Pandora runs cannot be reproduced. Here draw ``i`` is
+  seeded with ``seed + i`` through :func:`seeded_holodeck_rng`.
+* Parameters stay aligned with spectra when draws are dropped. Pandora drops a
+  draw whose spectrum is not finite, and then pairs spectra with
+  ``theta[:n_files]``, which shifts every later draw onto the wrong
+  parameters. Atlas tracks the draw index of each spectrum instead.
+* Normalization works column by column instead of building the full
+  ``(n_draws, n_real, n_pars + n_f)`` array. The result is bitwise identical.
+
+Frequencies
+-----------
+``freqs=None`` converts ``hc`` at ``f_i = i/T`` (Pandora's choice, and also the
+centres of holodeck's bins, whose edges are at ``(i +- 1/2)/T``). An explicit
+array of ``n_freqs`` frequencies may be passed instead.
+
+holodeck and h5py are imported lazily, so this module imports without the
+``[astro]`` extra.
+"""
+
+import json
+import os
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from functools import lru_cache
+
+import numpy as np
+
+from ATLAS.astro.utils import (
+    conversion_freqs,
+    default_tag,
+    draw_indices_on_disk,
+    draw_path,
+    metadata_path,
+    read_metadata,
+    simulate_and_save,
+)
+
+__all__ = [
+    "PANDORA_PHENOM_DEFAULTS",
+    "PANDORA_PHENOM_PARAM_NAMES",
+    "pandora_phenom_param_space",
+    "gwb_frequencies",
+    "hc_to_log10_rho",
+    "seeded_holodeck_rng",
+    "simulate_log10_rho",
+    "generate_training_set",
+    "combine_training_set",
+    "load_holodeck_library",
+    "TrainingSet",
+]
+
+PARAMS_FILE = "test_astro_params.npy"
+
+# Fixed SAM / hardening settings of Pandora's phenom model
+# (AstroInferenceUpdated.ipynb, cell 16). The parameters varied in Pandora's
+# training sets are listed in PANDORA_PHENOM_PARAM_NAMES; their values here
+# are only defaults.
+PANDORA_PHENOM_DEFAULTS = dict(
+    hard_time=3.0,
+    hard_sepa_init=1e4,
+    hard_rchar=100.0,
+    hard_gamma_inner=-1.0,
+    hard_gamma_outer=+2.5,
+
+    gsmf_phi0_log10=-2.77,
+    gsmf_phiz=-0.6,
+    gsmf_mchar0_log10=11.24,
+    gsmf_mcharz=0.11,
+    gsmf_alpha0=-1.21,
+    gsmf_alphaz=-0.03,
+
+    gpf_frac_norm_allq=0.025,
+    gpf_malpha=0.0,
+    gpf_qgamma=0.0,
+    gpf_zbeta=1.0,
+    gpf_max_frac=1.0,
+
+    gmt_norm=0.5,
+    gmt_malpha=0.0,
+    gmt_qgamma=-1.0,
+    gmt_zbeta=-0.5,
+
+    mmb_mamp_log10=8.69,
+    mmb_plaw=1.10,
+    mmb_scatter_dex=0.3,
+)
+
+# Order matches the flow context in Pandora (cell 20).
+PANDORA_PHENOM_PARAM_NAMES = (
+    "hard_time",
+    "gsmf_phi0_log10",
+    "gsmf_mchar0_log10",
+    "mmb_mamp_log10",
+    "mmb_scatter_dex",
+    "hard_gamma_inner",
+)
+
+
+########################################################################################
+# Parameter spaces
+########################################################################################
+
+@lru_cache(maxsize=None)
+def _pandora_phenom_class():
+    """Define ``PS_Pandora_Phenom`` on first use, so holodeck stays optional."""
+    import holodeck as holo
+    from holodeck.constants import GYR, PC
+    from holodeck.librarian.lib_tools import _Param_Space, PD_Normal, PD_Uniform
+
+    class PS_Pandora_Phenom(_Param_Space):
+        """Pandora's 6-parameter phenom SAM (AstroInferenceUpdated.ipynb).
+
+        GSMF Schechter + GPF/GMT power laws + KH2013 M-Mbulge, with
+        ``Fixed_Time_2PL_SAM`` hardening. ``defaults`` overrides entries of
+        :data:`PANDORA_PHENOM_DEFAULTS`.
+        """
+
+        DEFAULTS = dict(PANDORA_PHENOM_DEFAULTS)
+
+        def __init__(self, log=None, nsamples=None, sam_shape=None, seed=None,
+                     defaults=None, **kwargs):
+            if defaults:
+                self.DEFAULTS = {**PANDORA_PHENOM_DEFAULTS, **defaults}
+            parameters = [
+                PD_Uniform("hard_time", 0.1, 11.0),
+                PD_Normal("gsmf_phi0_log10", -2.56, 0.4),
+                PD_Normal("gsmf_mchar0_log10", 10.9, 0.4),
+                PD_Normal("mmb_mamp_log10", 8.6, 0.2),
+                PD_Normal("mmb_scatter_dex", 0.32, 0.15),
+                PD_Uniform("hard_gamma_inner", -1.5, 0.0),
+            ]
+            _Param_Space.__init__(self, parameters, log=log, nsamples=nsamples,
+                                  sam_shape=sam_shape, seed=seed, **kwargs)
+
+        def _init_sam(self, sam_shape, params):
+            gsmf = holo.sams.GSMF_Schechter(
+                phi0=params["gsmf_phi0_log10"],
+                phiz=params["gsmf_phiz"],
+                mchar0_log10=params["gsmf_mchar0_log10"],
+                mcharz=params["gsmf_mcharz"],
+                alpha0=params["gsmf_alpha0"],
+                alphaz=params["gsmf_alphaz"],
+            )
+            gpf = holo.sams.GPF_Power_Law(
+                frac_norm_allq=params["gpf_frac_norm_allq"],
+                malpha=params["gpf_malpha"],
+                qgamma=params["gpf_qgamma"],
+                zbeta=params["gpf_zbeta"],
+                max_frac=params["gpf_max_frac"],
+            )
+            gmt = holo.sams.GMT_Power_Law(
+                time_norm=params["gmt_norm"] * GYR,
+                malpha=params["gmt_malpha"],
+                qgamma=params["gmt_qgamma"],
+                zbeta=params["gmt_zbeta"],
+            )
+            mmbulge = holo.host_relations.MMBulge_KH2013(
+                mamp_log10=params["mmb_mamp_log10"],
+                mplaw=params["mmb_plaw"],
+                scatter_dex=params["mmb_scatter_dex"],
+            )
+            return holo.sams.Semi_Analytic_Model(
+                gsmf=gsmf, gpf=gpf, gmt=gmt, mmbulge=mmbulge, shape=sam_shape,
+            )
+
+        def _init_hard(self, sam, params):
+            return holo.hardening.Fixed_Time_2PL_SAM(
+                sam,
+                params["hard_time"] * GYR,
+                sepa_init=params["hard_sepa_init"] * PC,
+                rchar=params["hard_rchar"] * PC,
+                gamma_inner=params["hard_gamma_inner"],
+                gamma_outer=params["hard_gamma_outer"],
+            )
+
+    # Pickle by reference through the module-level __getattr__ below, so
+    # joblib workers can receive instances.
+    PS_Pandora_Phenom.__module__ = __name__
+    PS_Pandora_Phenom.__qualname__ = "PS_Pandora_Phenom"
+    return PS_Pandora_Phenom
+
+
+def pandora_phenom_param_space(nsamples=None, sam_shape=(30, 30, 30), seed=None,
+                               defaults=None):
+    """
+    Pandora's phenom parameter space as a holodeck ``_Param_Space``.
+
+    Parameters
+    ----------
+    nsamples : int or None
+        Number of Latin-hypercube draws. ``None`` builds the space without
+        draws, e.g. to call ``model_for_params`` directly.
+    sam_shape : int or (3,) tuple of int
+        SAM grid (total mass, mass ratio, redshift). Pandora uses (30, 30, 30).
+    seed : int or None
+        Seed for ``scipy.stats.qmc.LatinHypercube``. With the same seed,
+        ``param_samples`` equals Pandora's cell-11 draws exactly.
+    defaults : dict or None
+        Overrides for :data:`PANDORA_PHENOM_DEFAULTS`.
+
+    Returns
+    -------
+    PS_Pandora_Phenom
+        Draws are in ``param_samples``, ordered as
+        :data:`PANDORA_PHENOM_PARAM_NAMES`.
+    """
+    cls = _pandora_phenom_class()
+    return cls(nsamples=nsamples, sam_shape=sam_shape, seed=seed, defaults=defaults)
+
+
+########################################################################################
+# Spectra
+########################################################################################
+
+def gwb_frequencies(tspan, n_freqs, freqs=None):
+    """
+    Frequencies used to convert ``hc`` to ``log10_rho``, plus holodeck's bin edges.
+
+    Parameters
+    ----------
+    tspan : float
+        Observing span [s].
+    n_freqs : int
+        Number of GWB frequency bins.
+    freqs : None or array_like
+        ``None``: ``f_i = i/T``, computed with Pandora's own expression.
+        An array: used as given, shape ``(n_freqs,)``.
+
+    Returns
+    -------
+    f_conv : (n_freqs,) ndarray
+    fobs_gw_edges : (n_freqs + 1,) ndarray
+        Bin edges passed to ``sam.gwb_new``.
+    """
+    from holodeck import utils as hutils
+
+    _, edges = hutils.pta_freqs(tspan, n_freqs)
+    return conversion_freqs(freqs, tspan, n_freqs), edges
+
+
+
+def hc_to_log10_rho(hc, f_conv, tspan):
+    """
+    ``0.5 * log10(hc^2 / (12 pi^2 f^3 T))``, the enterprise ``log10_rho``.
+
+    ``f_conv`` must broadcast against ``hc``. The operation order matches
+    Pandora's, so the result is bitwise identical.
+    """
+    return 0.5 * np.log10(hc**2 / (12 * np.pi**2 * f_conv**3 * tspan))
+
+
+@contextmanager
+def seeded_holodeck_rng(seed):
+    """
+    Make holodeck's GWB realizations reproducible inside this context.
+
+    ``holodeck.cyutils`` builds a fresh, unseeded ``numpy.random.PCG64()`` on
+    every call to ``sam_poisson_gwb`` (the ``realize=int`` path of
+    ``gwb_new``), so ``np.random.seed`` has no effect on it. This temporarily
+    replaces that module's ``PCG64`` with one drawing from
+    ``SeedSequence(seed)``, and seeds the global numpy RNG (used by holodeck's
+    other realization paths). Both are restored on exit. ``seed=None`` does
+    nothing.
+    """
+    if seed is None:
+        yield
+        return
+    import holodeck.cyutils as cy
+
+    seq = np.random.SeedSequence(seed)
+    orig_pcg, orig_state = cy.PCG64, np.random.get_state()
+    cy.PCG64 = lambda: np.random.PCG64(seq.spawn(1)[0])
+    np.random.seed(seed)
+    try:
+        yield
+    finally:
+        cy.PCG64 = orig_pcg
+        np.random.set_state(orig_state)
+
+
+def simulate_log10_rho(pspace, params, tspan, n_freqs, n_real, freqs=None,
+                       seed=None, sam_shape=None):
+    """
+    Simulate ``n_real`` GWB realizations for one parameter draw.
+
+    Parameters
+    ----------
+    pspace : holodeck ``_Param_Space``
+        Builds the SAM and hardening model through ``model_for_params``.
+    params : dict or array_like
+        Parameter values; an array is matched to ``pspace.param_names``.
+    tspan, n_freqs, freqs
+        See :func:`gwb_frequencies`.
+    n_real : int
+        Number of Poisson realizations.
+    seed : int or None
+        Seeds the realizations through :func:`seeded_holodeck_rng`.
+        ``None`` leaves them unseeded, as in Pandora.
+    sam_shape : optional
+        Overrides ``pspace.sam_shape``.
+
+    Returns
+    -------
+    (n_freqs, n_real) ndarray
+        ``log10_rho``. Bins without any sources give ``-inf``.
+    """
+    if not isinstance(params, dict):
+        params = dict(zip(pspace.param_names, np.asarray(params)))
+    f_conv, edges = gwb_frequencies(tspan, n_freqs, freqs)
+    with seeded_holodeck_rng(seed):
+        sam, hard = pspace.model_for_params(params, sam_shape=sam_shape)
+        hc = sam.gwb_new(edges, hard=hard, realize=n_real)
+    return hc_to_log10_rho(hc, f_conv[:, None], tspan)
+
+
+########################################################################################
+# Training sets
+########################################################################################
+
+def generate_training_set(pspace, save_dir, tspan, n_freqs=5, n_real=10_000,
+                          freqs=None, params=None, indices=None, n_jobs=1,
+                          seed=None, sam_shape=None, overwrite=False, tag=None,
+                          combine=True):
+    """
+    Simulate GWB spectra for each parameter draw and save them in Pandora's layout.
+
+    Parameters
+    ----------
+    pspace : holodeck ``_Param_Space``
+        E.g. :func:`pandora_phenom_param_space` or any ``holodeck.librarian``
+        space. Supplies the draws (``param_samples``) unless ``params`` is given.
+    save_dir : str
+        Output directory, created if needed.
+    tspan : float
+        Observing span [s]. Pandora uses ``20 * YR``.
+    n_freqs, n_real : int
+        Frequency bins and Poisson realizations per draw.
+    freqs : None or array_like
+        See :func:`gwb_frequencies`.
+    params : (n_draws, n_pars) array_like, optional
+        Parameter draws to use instead of ``pspace.param_samples``, e.g. a
+        Pandora ``test_astro_params.npy``.
+    indices : iterable of int, optional
+        Draws to run (default: all). Use this to split a run across jobs.
+    n_jobs : int
+        joblib workers.
+    seed : int or None
+        Draw ``i`` is seeded with ``seed + i`` (:func:`seeded_holodeck_rng`).
+    sam_shape : optional
+        Overrides ``pspace.sam_shape``.
+    overwrite : bool
+        Rerun draws whose output already exists (or that were already found
+        to be non-finite). Otherwise they are skipped, so runs can resume.
+    tag : str, optional
+        File suffix, default ``f"{tspan/YR:g}yrs"`` as in Pandora.
+    combine : bool
+        Also run :func:`combine_training_set` and return its result.
+
+    Returns
+    -------
+    TrainingSet or None
+        ``None`` if ``combine=False``.
+
+    Notes
+    -----
+    A draw with a non-finite spectrum (a bin with no sources) is not saved,
+    as in Pandora. It is recorded under ``bad_indices`` in the metadata file.
+    """
+    from joblib import Parallel, delayed
+    from tqdm_joblib import tqdm_joblib
+
+    os.makedirs(save_dir, exist_ok=True)
+    tag = tag or default_tag(tspan)
+    params = np.asarray(pspace.param_samples if params is None else params)
+    if params.ndim != 2 or params.shape[1] != len(pspace.param_names):
+        raise ValueError(f"params has shape {params.shape}, expected "
+                         f"(n_draws, {len(pspace.param_names)})")
+    sam_shape = pspace.sam_shape if sam_shape is None else sam_shape
+    f_conv, _ = gwb_frequencies(tspan, n_freqs, freqs)
+
+    meta = read_metadata(save_dir, tag)
+    bad = set(meta.get("bad_indices", []))
+    params_path = os.path.join(save_dir, PARAMS_FILE)
+    if os.path.exists(params_path) and not overwrite:
+        if not np.array_equal(np.load(params_path), params):
+            raise ValueError(f"{params_path} holds different draws; pass overwrite=True "
+                             "or use a new save_dir")
+    else:
+        np.save(params_path, params)
+
+    indices = range(len(params)) if indices is None else indices
+    todo = [int(i) for i in indices
+            if overwrite or (not os.path.exists(draw_path(save_dir, i, tag)) and i not in bad)]
+
+    def draw_seed(i):
+        return None if seed is None else seed + i
+
+    jobs = (delayed(simulate_and_save)(pspace, i, params[i], draw_path(save_dir, i, tag),
+                                        tspan, n_freqs, n_real, freqs, draw_seed(i), sam_shape)
+            for i in todo)
+    with tqdm_joblib(desc="GWB draws", total=len(todo)):
+        results = Parallel(n_jobs=n_jobs)(jobs)
+
+    for i, ok in results:
+        (bad.discard if ok else bad.add)(i)
+
+    from holodeck import __version__ as holo_version
+
+    meta.update(
+        tag=tag,
+        param_names=list(pspace.param_names),
+        param_space=pspace.name,
+        tspan=float(tspan),
+        n_freqs=int(n_freqs),
+        n_real=int(n_real),
+        freqs="default" if freqs is None else "array",
+        f_conv=f_conv.tolist(),
+        sam_shape=np.asarray(sam_shape).tolist() if sam_shape is not None else None,
+        seed=seed,
+        holodeck_version=holo_version,
+        bad_indices=sorted(bad),
+    )
+    with open(metadata_path(save_dir, tag), "w") as fh:
+        json.dump(meta, fh, indent=2)
+
+    return combine_training_set(save_dir, tag) if combine else None
+
+
+def combine_training_set(save_dir, tag):
+    """
+    Combine per-draw spectra into ``gwb_spectrum_samples_{tag}.npy`` (cell 25).
+
+    The combined file is a ``(n_kept, n_real, n_f)`` memmap in draw-index
+    order. Unlike Pandora, parameters are matched to spectra by draw index,
+    so dropped draws do not shift the pairing.
+
+    Returns
+    -------
+    TrainingSet
+    """
+    indices = draw_indices_on_disk(save_dir, tag)
+    if indices.size == 0:
+        raise FileNotFoundError(f"no '*_{tag}.npy' draws in {save_dir}")
+    first = np.load(draw_path(save_dir, indices[0], tag))
+    n_f, n_real = first.shape
+    out = np.lib.format.open_memmap(
+        os.path.join(save_dir, f"gwb_spectrum_samples_{tag}.npy"),
+        mode="w+", dtype="float64", shape=(len(indices), n_real, n_f),
+        fortran_order=False)
+    for row, idx in enumerate(indices):
+        out[row] = np.load(draw_path(save_dir, idx, tag)).T
+    out.flush()
+    del out
+    return TrainingSet.from_pandora_files(save_dir, tag, indices=indices)
+
+
+@dataclass
+class TrainingSet:
+    """
+    Astrophysical parameter draws paired with their simulated ``log10_rho``.
+
+    Attributes
+    ----------
+    params : (n_draws, n_pars) ndarray
+    log10_rho : (n_draws, n_real, n_f) ndarray
+        May be a read-only memmap.
+    param_names : list of str
+    f_conv : (n_f,) ndarray or None
+        Frequencies used in the ``hc -> log10_rho`` conversion.
+    tspan : float or None
+    draw_indices : (n_draws,) ndarray
+        Row of each draw in the full parameter file.
+    metadata : dict
+    """
+
+    params: np.ndarray
+    log10_rho: np.ndarray
+    param_names: list
+    f_conv: np.ndarray = None
+    tspan: float = None
+    draw_indices: np.ndarray = None
+    metadata: dict = field(default_factory=dict)
+
+    def __post_init__(self):
+        if self.params.shape[0] != self.log10_rho.shape[0]:
+            raise ValueError(f"{self.params.shape[0]} parameter draws but "
+                             f"{self.log10_rho.shape[0]} spectra")
+        if self.draw_indices is None:
+            self.draw_indices = np.arange(self.params.shape[0])
+
+    @property
+    def n_draws(self):
+        return self.log10_rho.shape[0]
+
+    @property
+    def n_real(self):
+        return self.log10_rho.shape[1]
+
+    @property
+    def n_freqs(self):
+        return self.log10_rho.shape[2]
+
+    @property
+    def n_params(self):
+        return self.params.shape[1]
+
+    @classmethod
+    def from_pandora_files(cls, save_dir, tag, params_file=PARAMS_FILE, indices=None):
+        """
+        Load ``gwb_spectrum_samples_{tag}.npy`` and its parameter file.
+
+        Works on directories written by Pandora's notebook or by
+        :func:`generate_training_set`. The draw index of each spectrum is
+        taken from ``indices`` if given, else from the per-draw
+        ``{i}_{tag}.npy`` files if present, else assumed to be
+        ``0..n-1`` (Pandora's assumption).
+        """
+        rho = np.load(os.path.join(save_dir, f"gwb_spectrum_samples_{tag}.npy"), mmap_mode="r")
+        all_params = np.load(os.path.join(save_dir, params_file))
+        if indices is None:
+            indices = draw_indices_on_disk(save_dir, tag)
+            if indices.size != rho.shape[0]:
+                indices = np.arange(rho.shape[0])
+        indices = np.asarray(indices, dtype=int)
+        meta = read_metadata(save_dir, tag)
+        names = meta.get("param_names", [f"param_{i}" for i in range(all_params.shape[1])])
+        f_conv = np.asarray(meta["f_conv"]) if "f_conv" in meta else None
+        return cls(params=all_params[indices], log10_rho=rho, param_names=list(names),
+                   f_conv=f_conv, tspan=meta.get("tspan"), draw_indices=indices,
+                   metadata=meta)
+
+    # ---- normalization (cells 28-31) -----------------------------------------
+
+    def normalization(self, B=5):
+        """
+        Pandora's affine map to ``[-B, B]``, per column of ``[params, log10_rho]``.
+
+        Returns
+        -------
+        dict
+            ``B``, and ``mean = (max+min)/2`` and ``half_range = (max-min)/2``,
+            each of shape ``(n_pars + n_f,)``.
+        """
+        # Pandora asserts the concatenated chain has no zeros (cell 28).
+        if not (np.all(self.params) and np.all(self.log10_rho)):
+            raise ValueError("training set contains exact zeros")
+        min_x = np.concatenate([np.min(self.params, axis=0),
+                                np.min(self.log10_rho, axis=(0, 1))])
+        max_x = np.concatenate([np.max(self.params, axis=0),
+                                np.max(self.log10_rho, axis=(0, 1))])
+        mean = (max_x + min_x) / 2
+        half_range = (max_x - min_x) / 2
+        return dict(B=B, mean=mean, half_range=half_range)
+
+    def normalize(self, B=5, mapping=None):
+        """
+        Map to ``[-B, B]`` in memory.
+
+        Parameters
+        ----------
+        B : float
+        mapping : dict, optional
+            Use this mapping (e.g. the full set's, for a split) instead of
+            computing one from this set; ``B`` is then taken from it.
+
+        Returns
+        -------
+        rho_norm : (n_draws, n_real, n_f) ndarray
+        ast_norm : (n_draws, n_pars) ndarray
+        mapping : dict
+            See :meth:`normalization`.
+        """
+        mapping = self.normalization(B) if mapping is None else mapping
+        B = mapping["B"]
+        p = self.n_params
+        mean, half = mapping["mean"], mapping["half_range"]
+        rho_norm = B * (np.asarray(self.log10_rho) - mean[p:]) / half[p:]
+        ast_norm = B * (self.params - mean[:p]) / half[:p]
+        return rho_norm, ast_norm, mapping
+
+    def save_normalized(self, save_dir, tag, B=5, chunk=256):
+        """
+        Write Pandora's normalized files (cell 31), streaming ``chunk`` draws at a time.
+
+        Writes ``gwb_spectrum_samples_{tag}_normalized.npy``,
+        ``ast_spectrum_samples_{tag}_normalized.npy`` and
+        ``gwb_spectrum_samples_{tag}_mapping_data.npy.npz``.
+
+        Returns
+        -------
+        dict
+            The mapping (see :meth:`normalization`).
+        """
+        mapping = self.normalization(B)
+        p = self.n_params
+        mean, half = mapping["mean"], mapping["half_range"]
+        rho_out = np.lib.format.open_memmap(
+            os.path.join(save_dir, f"gwb_spectrum_samples_{tag}_normalized.npy"),
+            mode="w+", dtype="float64", shape=self.log10_rho.shape)
+        for start in range(0, self.n_draws, chunk):
+            sl = slice(start, start + chunk)
+            rho_out[sl] = B * (self.log10_rho[sl] - mean[p:]) / half[p:]
+        rho_out.flush()
+        del rho_out
+        np.save(os.path.join(save_dir, f"ast_spectrum_samples_{tag}_normalized.npy"),
+                B * (self.params - mean[:p]) / half[:p])
+        np.savez_compressed(os.path.join(save_dir, f"gwb_spectrum_samples_{tag}_mapping_data.npy"),
+                            B=B, mean=mean, half_range=half)
+        return mapping
+
+    # ---- train / validation split (DataSplitter) ---------------------------------
+
+    def split(self, n_val_draws, n_val_real, seeds=(0, 1)):
+        """
+        Hold out a validation set, as Pandora's ``DataSplitter`` does.
+
+        ``n_val_draws`` parameter draws and ``n_val_real`` realizations are
+        chosen at random; the validation set is their cross product, and the
+        training set is everything outside both (so the two share neither
+        draws nor realizations). Reproduces ``DataSplitter.splitter_mesh`` on
+        ``log10_rho`` and ``DataSplitter.splitter`` on ``params`` given the
+        same seeds.
+
+        Parameters
+        ----------
+        n_val_draws, n_val_real : int
+        seeds : (int, int)
+            Seeds for the draw and realization choices.
+
+        Returns
+        -------
+        train, val : TrainingSet
+            Validation rows follow the random draw order, as in Pandora.
+        """
+        import random
+
+        v0 = random.Random(seeds[0]).sample(range(self.n_draws), k=n_val_draws)
+        v1 = random.Random(seeds[1]).sample(range(self.n_real), k=n_val_real)
+        keep0 = np.ones(self.n_draws, dtype=bool)
+        keep0[v0] = False
+        keep1 = np.ones(self.n_real, dtype=bool)
+        keep1[v1] = False
+
+        def subset(rows, rho):
+            return TrainingSet(params=self.params[rows], log10_rho=rho,
+                               param_names=list(self.param_names), f_conv=self.f_conv,
+                               tspan=self.tspan, draw_indices=self.draw_indices[rows],
+                               metadata=dict(self.metadata))
+
+        rho = self.log10_rho
+        train = subset(keep0, rho[np.ix_(keep0, keep1)])
+        val = subset(v0, rho[np.ix_(v0, v1)])
+        return train, val
+
+
+def load_holodeck_library(path, n_freqs, tspan=None, freqs=None, hc_floor=1e-20):
+    """
+    Load a holodeck librarian HDF5 library (e.g. ``sam_lib.hdf5``) as a TrainingSet.
+
+    Follows Pandora's legacy loader (NormalizingFlowTrainDEMO.ipynb): keep the
+    first ``n_freqs`` bins of ``gwb``, raise ``hc`` below ``hc_floor`` to
+    ``hc_floor``, and convert to ``log10_rho``.
+
+    Parameters
+    ----------
+    path : str
+    n_freqs : int
+    tspan : float, optional
+        Observing span [s]. Defaults to the inverse bin width of the
+        library's ``fobs_edges``.
+    freqs : None or array_like
+        See :func:`gwb_frequencies`.
+    hc_floor : float or None
+        ``None`` disables the floor (empty bins then give ``-inf``).
+
+    Returns
+    -------
+    TrainingSet
+    """
+    import h5py
+
+    with h5py.File(path, "r") as h5:
+        if "gwb" not in h5:
+            raise KeyError(f"{path} has no 'gwb' dataset")
+        hc = h5["gwb"][:, :n_freqs, :]
+        params = h5["sample_params"][()]
+        names = [n.decode() if isinstance(n, bytes) else str(n)
+                 for n in h5.attrs["param_names"]]
+        edges = h5["fobs_edges"][()] if "fobs_edges" in h5 else None
+
+    if tspan is None:
+        if edges is None:
+            raise ValueError("library has no 'fobs_edges'; pass tspan")
+        tspan = 1.0 / (edges[1] - edges[0])
+    f_conv = conversion_freqs(freqs, tspan, n_freqs)
+
+    if hc_floor is not None:
+        hc[hc < hc_floor] = hc_floor
+    # Pandora floors in the stored dtype, then upcasts by concatenating with
+    # the float64 parameters before taking the log.
+    hc = hc.astype(np.float64)
+    rho = hc_to_log10_rho(hc.transpose((0, 2, 1)), f_conv[None, None, :], tspan)
+    meta = dict(source=os.path.abspath(path), tspan=float(tspan), n_freqs=int(n_freqs),
+                freqs="default" if freqs is None else "array",
+                f_conv=f_conv.tolist(), hc_floor=hc_floor, param_names=names)
+    return TrainingSet(params=params, log10_rho=rho, param_names=names, f_conv=f_conv,
+                       tspan=float(tspan), metadata=meta)
+
+
+#############################################
+##            Helper functions             ##
+#############################################
+
+def __getattr__(name):
+    # Lazy class lookup; must live in this module so PS_Pandora_Phenom
+    # instances pickle by reference (joblib workers).
+    if name == "PS_Pandora_Phenom":
+        return _pandora_phenom_class()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

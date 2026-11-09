@@ -1,4 +1,4 @@
-"""Training-set generation in ATLAS.experimental.astro, checked against Pandora.
+"""Training-set generation in ATLAS.astro, checked against Pandora.
 
 The reference is Pandora's notebook code, copied into
 tests/pandora_reference/notebook_trainset.py. Identity tests compare with
@@ -17,7 +17,7 @@ import os
 import numpy as np
 import pytest
 
-from ATLAS.experimental import astro
+from ATLAS.astro.flows import trainset
 from tests.pandora_reference import notebook_trainset as ref
 
 # Small enough to run in seconds; the code paths are the same as at full size.
@@ -46,7 +46,7 @@ def pspace():
     import logging
     import holodeck
     holodeck.log.setLevel(logging.WARNING)
-    return astro.pandora_phenom_param_space(nsamples=N_DRAWS, sam_shape=SAM_SHAPE, seed=SEED)
+    return trainset.pandora_phenom_param_space(nsamples=N_DRAWS, sam_shape=SAM_SHAPE, seed=SEED)
 
 
 @pytest.fixture(scope="module")
@@ -56,7 +56,7 @@ def pandora_dir(tmp_path_factory, pspace):
     theta = ref.lhs_draws(N_DRAWS, SEED)
     doit = ref.make_doit(theta, d, SAM_SHAPE, N_REAL, YRS, N_FREQS)
     for rr in range(N_DRAWS):
-        with astro.seeded_holodeck_rng(SEED + rr):
+        with trainset.seeded_holodeck_rng(SEED + rr):
             doit(rr)
     ref.combine(d, YRS, N_REAL, N_FREQS)
     ref.prepare(d, theta, YRS)
@@ -66,7 +66,7 @@ def pandora_dir(tmp_path_factory, pspace):
 @pytest.fixture(scope="module")
 def atlas_set(tmp_path_factory, pspace, tspan):
     d = str(tmp_path_factory.mktemp("atlas"))
-    ts = astro.generate_training_set(pspace, d, tspan, n_freqs=N_FREQS, n_real=N_REAL,
+    ts = trainset.generate_training_set(pspace, d, tspan, n_freqs=N_FREQS, n_real=N_REAL,
                                      seed=SEED)
     ts.save_normalized(d, ts.metadata["tag"])
     return d, ts
@@ -76,16 +76,16 @@ def atlas_set(tmp_path_factory, pspace, tspan):
 
 @pytest.mark.astro
 def test_lhs_draws_match_pandora(pspace):
-    assert pspace.param_names == list(astro.PANDORA_PHENOM_PARAM_NAMES)
-    big = astro.pandora_phenom_param_space(nsamples=200, sam_shape=SAM_SHAPE, seed=3)
+    assert pspace.param_names == list(trainset.PANDORA_PHENOM_PARAM_NAMES)
+    big = trainset.pandora_phenom_param_space(nsamples=200, sam_shape=SAM_SHAPE, seed=3)
     assert np.array_equal(big.param_samples, ref.lhs_draws(200, 3))
 
 
 @pytest.mark.astro
 def test_phenom_defaults_match_pandora():
-    assert set(astro.PANDORA_PHENOM_DEFAULTS) == set(ref.params)
-    fixed = set(ref.params) - set(astro.PANDORA_PHENOM_PARAM_NAMES)
-    assert all(astro.PANDORA_PHENOM_DEFAULTS[k] == ref.params[k] for k in fixed)
+    assert set(trainset.PANDORA_PHENOM_DEFAULTS) == set(ref.params)
+    fixed = set(ref.params) - set(trainset.PANDORA_PHENOM_PARAM_NAMES)
+    assert all(trainset.PANDORA_PHENOM_DEFAULTS[k] == ref.params[k] for k in fixed)
 
 
 @pytest.mark.astro
@@ -145,35 +145,35 @@ def test_holodeck_library_matches_pandora_legacy(tmp_path, tspan, dtype):
     path = str(tmp_path / "lib.hdf5")
     _write_library(path, tspan, dtype)
     chain, names = ref.legacy_library_chain(path, N_FREQS, tspan)
-    ts = astro.load_holodeck_library(path, N_FREQS, tspan=tspan)
+    ts = trainset.load_holodeck_library(path, N_FREQS, tspan=tspan)
     assert ts.param_names == names
     assert np.array_equal(ts.log10_rho, chain[..., -N_FREQS:])
     assert np.array_equal(ts.params, chain[:, 0, :-N_FREQS])
     # tspan inferred from the library's bin width
-    assert np.isclose(astro.load_holodeck_library(path, N_FREQS).tspan, tspan, rtol=1e-12)
+    assert np.isclose(trainset.load_holodeck_library(path, N_FREQS).tspan, tspan, rtol=1e-12)
 
 
 # ---- behaviour --------------------------------------------------------------------
 
 @pytest.mark.astro
 def test_freqs_options(tspan):
-    f, edges = astro.gwb_frequencies(tspan, 14)
+    f, edges = trainset.gwb_frequencies(tspan, 14)
     # i/T, which is also the centre of holodeck's bins
     assert np.allclose(f, np.arange(1, 15) / tspan, rtol=1e-15, atol=0)
     assert np.allclose(edges, (np.arange(15) + 0.5) / tspan, rtol=1e-15, atol=0)
     custom = np.linspace(1e-9, 5e-9, 14)
-    assert np.array_equal(astro.gwb_frequencies(tspan, 14, custom)[0], custom)
+    assert np.array_equal(trainset.gwb_frequencies(tspan, 14, custom)[0], custom)
     with pytest.raises(ValueError):
-        astro.gwb_frequencies(tspan, 14, custom[:3])
+        trainset.gwb_frequencies(tspan, 14, custom[:3])
     with pytest.raises(ValueError):
-        astro.gwb_frequencies(tspan, 14, "centers")
+        trainset.gwb_frequencies(tspan, 14, "centers")
 
 
 @pytest.mark.astro
 def test_freqs_array_changes_conversion(tmp_path, pspace, tspan):
-    f = astro.gwb_frequencies(tspan, N_FREQS)[0] * 2
-    a = astro.simulate_log10_rho(pspace, pspace.param_samples[0], tspan, N_FREQS, N_REAL, seed=1)
-    b = astro.simulate_log10_rho(pspace, pspace.param_samples[0], tspan, N_FREQS, N_REAL,
+    f = trainset.gwb_frequencies(tspan, N_FREQS)[0] * 2
+    a = trainset.simulate_log10_rho(pspace, pspace.param_samples[0], tspan, N_FREQS, N_REAL, seed=1)
+    b = trainset.simulate_log10_rho(pspace, pspace.param_samples[0], tspan, N_FREQS, N_REAL,
                                  freqs=f, seed=1)
     # log10_rho ~ -1.5 log10 f at fixed hc
     assert np.allclose(b - a, -1.5 * np.log10(2), atol=1e-12)
@@ -182,11 +182,11 @@ def test_freqs_array_changes_conversion(tmp_path, pspace, tspan):
 @pytest.mark.astro
 def test_seed_reproducible_across_workers(tmp_path, pspace, tspan, atlas_set):
     _, serial = atlas_set
-    par = astro.generate_training_set(pspace, str(tmp_path), tspan, n_freqs=N_FREQS,
+    par = trainset.generate_training_set(pspace, str(tmp_path), tspan, n_freqs=N_FREQS,
                                       n_real=N_REAL, seed=SEED, n_jobs=2)
     assert np.array_equal(par.log10_rho, serial.log10_rho)
-    a = astro.simulate_log10_rho(pspace, pspace.param_samples[0], tspan, N_FREQS, N_REAL, seed=5)
-    b = astro.simulate_log10_rho(pspace, pspace.param_samples[0], tspan, N_FREQS, N_REAL, seed=6)
+    a = trainset.simulate_log10_rho(pspace, pspace.param_samples[0], tspan, N_FREQS, N_REAL, seed=5)
+    b = trainset.simulate_log10_rho(pspace, pspace.param_samples[0], tspan, N_FREQS, N_REAL, seed=6)
     assert not np.array_equal(a, b)
 
 
@@ -194,18 +194,18 @@ def test_seed_reproducible_across_workers(tmp_path, pspace, tspan, atlas_set):
 def test_resume_skips_existing_draws(tmp_path, pspace, tspan):
     d = str(tmp_path)
     kw = dict(n_freqs=N_FREQS, n_real=N_REAL, seed=SEED)
-    astro.generate_training_set(pspace, d, tspan, indices=[0, 1], combine=False, **kw)
+    trainset.generate_training_set(pspace, d, tspan, indices=[0, 1], combine=False, **kw)
     first = {i: os.stat(os.path.join(d, f"{i}_{YRS}yrs.npy")).st_mtime_ns for i in (0, 1)}
-    ts = astro.generate_training_set(pspace, d, tspan, **kw)
+    ts = trainset.generate_training_set(pspace, d, tspan, **kw)
     assert {i: os.stat(os.path.join(d, f"{i}_{YRS}yrs.npy")).st_mtime_ns for i in (0, 1)} == first
     assert list(ts.draw_indices) == [0, 1, 2]
     with pytest.raises(ValueError, match="different draws"):
-        astro.generate_training_set(pspace, d, tspan, params=pspace.param_samples + 1, **kw)
+        trainset.generate_training_set(pspace, d, tspan, params=pspace.param_samples + 1, **kw)
 
 
 @pytest.mark.astro
 def test_nonfinite_draw_is_dropped_and_recorded(tmp_path, pspace, tspan, monkeypatch):
-    real = astro.simulate_log10_rho
+    real = trainset.simulate_log10_rho
 
     def fake(pspace, params, *args, **kwargs):
         rho = real(pspace, params, *args, **kwargs)
@@ -213,9 +213,9 @@ def test_nonfinite_draw_is_dropped_and_recorded(tmp_path, pspace, tspan, monkeyp
             rho[0, 0] = -np.inf
         return rho
 
-    monkeypatch.setattr(astro, "simulate_log10_rho", fake)
+    monkeypatch.setattr(trainset, "simulate_log10_rho", fake)
     d = str(tmp_path)
-    ts = astro.generate_training_set(pspace, d, tspan, n_freqs=N_FREQS, n_real=N_REAL, seed=SEED)
+    ts = trainset.generate_training_set(pspace, d, tspan, n_freqs=N_FREQS, n_real=N_REAL, seed=SEED)
     assert list(ts.draw_indices) == [0, 2]
     assert np.array_equal(ts.params, pspace.param_samples[[0, 2]])
     with open(os.path.join(d, f"trainset_{YRS}yrs_metadata.json")) as fh:
@@ -227,7 +227,7 @@ def test_nonfinite_draw_is_dropped_and_recorded(tmp_path, pspace, tspan, monkeyp
 def _fake_pandora_dir(d, indices, n_draws=5, n_f=3, n_real=7, tag="15yrs"):
     rng = np.random.default_rng(0)
     params = rng.normal(size=(n_draws, 2)) + 3
-    np.save(os.path.join(d, astro.PARAMS_FILE), params)
+    np.save(os.path.join(d, trainset.PARAMS_FILE), params)
     for i in indices:
         np.save(os.path.join(d, f"{i}_{tag}.npy"), rng.normal(size=(n_f, n_real)) - 8)
     return params
@@ -238,7 +238,7 @@ def test_combine_keeps_params_aligned_after_dropped_draws(tmp_path):
     draw 2's spectrum on draw 1's parameters here. Atlas pairs by draw index."""
     d = str(tmp_path)
     params = _fake_pandora_dir(d, [0, 2, 3, 4])
-    ts = astro.combine_training_set(d, "15yrs")
+    ts = trainset.combine_training_set(d, "15yrs")
     assert list(ts.draw_indices) == [0, 2, 3, 4]
     assert np.array_equal(ts.params, params[[0, 2, 3, 4]])
     for row, i in enumerate(ts.draw_indices):
@@ -249,10 +249,10 @@ def test_from_pandora_files_without_per_draw_files(tmp_path):
     """A directory holding only Pandora's combined file falls back to rows 0..n-1."""
     d = str(tmp_path)
     params = _fake_pandora_dir(d, [0, 1, 2])
-    astro.combine_training_set(d, "15yrs")
+    trainset.combine_training_set(d, "15yrs")
     for i in range(3):
         os.remove(os.path.join(d, f"{i}_15yrs.npy"))
-    ts = astro.TrainingSet.from_pandora_files(d, "15yrs")
+    ts = trainset.TrainingSet.from_pandora_files(d, "15yrs")
     assert np.array_equal(ts.params, params[:3])
     assert ts.param_names == ["param_0", "param_1"]
 
@@ -260,7 +260,7 @@ def test_from_pandora_files_without_per_draw_files(tmp_path):
 def test_save_normalized_streams_in_chunks(tmp_path):
     d = str(tmp_path)
     _fake_pandora_dir(d, range(5))
-    ts = astro.combine_training_set(d, "15yrs")
+    ts = trainset.combine_training_set(d, "15yrs")
     ts.save_normalized(d, "15yrs", chunk=2)
     rho_n, ast_n, mapping = ts.normalize()
     assert np.array_equal(np.load(os.path.join(d, "gwb_spectrum_samples_15yrs_normalized.npy")), rho_n)
@@ -269,7 +269,7 @@ def test_save_normalized_streams_in_chunks(tmp_path):
 
 
 def test_normalization_rejects_exact_zeros(tmp_path):
-    ts = astro.TrainingSet(params=np.array([[0.0, 1.0]]), log10_rho=-np.ones((1, 2, 3)),
+    ts = trainset.TrainingSet(params=np.array([[0.0, 1.0]]), log10_rho=-np.ones((1, 2, 3)),
                            param_names=["a", "b"])
     with pytest.raises(ValueError, match="zeros"):
         ts.normalization()

@@ -1,7 +1,7 @@
 """
 Differentiable conditional normalizing flows for astro inference (flax NNX, distrax, optax).
 
-The JAX counterpart of ``zuko_flows.py``: the same flows, written so they can
+The JAX counterpart of ``ATLAS.astro.flows.zuko``: the same flows, written so they can
 be jitted, vmapped and differentiated, and so dropped into numpyro models.
 Two architectures are available:
 
@@ -16,9 +16,9 @@ Two architectures are available:
   conditioners start at zero, so an untrained flow is its base distribution.
 
 :class:`FlaxAstroFlow` works in physical units, mirroring
-``zuko_flows.ZukoAstroFlow``; :class:`FlowDistribution` wraps it as a numpyro
+``ATLAS.astro.flows.zuko.ZukoAstroFlow``; :class:`FlowDistribution` wraps it as a numpyro
 distribution; :class:`FlaxFlowTrainer` trains either architecture with optax,
-drawing the same batches as the zuko trainer (``flow_utils.BatchSampler``)
+drawing the same batches as the zuko trainer (``ATLAS.astro.flows.utils.BatchSampler``)
 but gathering them on the device and running the steps between checkpoints
 as one ``lax.scan`` (Pelargir's training loop), so GPU training is not bound
 by per-step dispatch.
@@ -42,7 +42,7 @@ import optax
 from flax import nnx
 from tqdm.auto import trange
 
-from ATLAS.experimental.flow_utils import (
+from ATLAS.astro.flows.utils import (
     NF_TYPES,
     BatchSampler,
     HellingerMonitor,
@@ -285,7 +285,7 @@ class ZukoNSF(nnx.Module):
     @classmethod
     def from_zuko(cls, nsf):
         """Copy a zuko ``NSF`` (with coupling transforms) into a :class:`ZukoNSF`."""
-        from ATLAS.experimental.zuko_flows import _flow_architecture
+        from ATLAS.astro.flows.zuko import _flow_architecture
 
         arch = _flow_architecture(nsf)
         model = cls(arch["n_features"], arch["n_context"], bins=arch["bins"],
@@ -595,7 +595,7 @@ class FlaxAstroFlow:
 
     @classmethod
     def from_zuko(cls, zuko_flow):
-        """Convert a ``zuko_flows.ZukoAstroFlow`` (e.g. from ``ZukoAstroFlow.from_pandora``)."""
+        """Convert a ``ATLAS.astro.flows.zuko.ZukoAstroFlow`` (e.g. from ``ZukoAstroFlow.from_pandora``)."""
         meta = {k: v for k, v in zuko_flow.metadata.items()}
         return cls(ZukoNSF.from_zuko(zuko_flow.flow), zuko_flow.nf_type, zuko_flow.mapping,
                    zuko_flow.n_params, metadata=meta)
@@ -697,7 +697,7 @@ def _sample_rows(model, key, c, ndraws):
 
 class FlaxFlowTrainer:
     """
-    Train a flax flow on normalized samples (``zuko_flows.FlowTrainer`` in JAX).
+    Train a flax flow on normalized samples (``ATLAS.astro.flows.zuko.FlowTrainer`` in JAX).
 
     Parameters
     ----------

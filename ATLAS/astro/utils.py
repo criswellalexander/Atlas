@@ -1,5 +1,5 @@
 """
-Helpers for :mod:`ATLAS.experimental.astro`: training-set file layout,
+Helpers for :mod:`ATLAS.astro`: training-set file layout,
 frequency conventions, the per-draw simulation worker, and GWB prior bounds.
 """
 
@@ -58,10 +58,10 @@ def draw_indices_on_disk(save_dir, tag):
 def simulate_and_save(pspace, idx, params, path, tspan, n_freqs, n_real, freqs,
                       seed, sam_shape):
     """joblib worker: simulate one draw and save it unless it is non-finite."""
-    # looked up at call time so tests can patch astro.simulate_log10_rho
-    from ATLAS.experimental import astro
+    # looked up at call time so tests can patch trainset.simulate_log10_rho
+    from ATLAS.astro.flows import trainset
 
-    rho = astro.simulate_log10_rho(pspace, params, tspan, n_freqs, n_real, freqs=freqs,
+    rho = trainset.simulate_log10_rho(pspace, params, tspan, n_freqs, n_real, freqs=freqs,
                                    seed=seed, sam_shape=sam_shape)
     if not np.isfinite(rho).all():
         return idx, False

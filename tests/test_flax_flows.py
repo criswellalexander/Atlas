@@ -19,8 +19,8 @@ import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
 from flax import nnx  # noqa: E402
 
-from ATLAS.experimental import astro  # noqa: E402
-from ATLAS.experimental import flax_flows as ff  # noqa: E402
+from ATLAS.astro.flows import train, trainset  # noqa: E402
+from ATLAS.astro.flows import flax as ff  # noqa: E402
 
 pytestmark = pytest.mark.astro
 
@@ -214,7 +214,7 @@ def test_nonfinite_loss_recovery(tmp_path, monkeypatch):
 def test_indices_then_gather_equals_call(mode, xp):
     import random
 
-    from ATLAS.experimental.flow_utils import BatchSampler, gather
+    from ATLAS.astro.flows.utils import BatchSampler, gather
 
     rng = np.random.default_rng(0)
     arr = (lambda a: a) if xp == "numpy" else jnp.asarray
@@ -253,7 +253,7 @@ def _small_set(n_draws=10, n_real=60, seed=0):
     params = rng.normal(size=(n_draws, P)) + np.array([3.0, -2.5])
     rho = (-8 + 0.3 * rng.normal(size=(n_draws, n_real, F))
            + 0.2 * params[:, None, :1] - 0.1 * np.arange(F))
-    return astro.TrainingSet(params=params, log10_rho=rho, param_names=["a", "b"],
+    return trainset.TrainingSet(params=params, log10_rho=rho, param_names=["a", "b"],
                              f_conv=np.arange(1, F + 1) / 1e9, tspan=1e9)
 
 
@@ -263,7 +263,7 @@ def test_train_astro_flow_flax_end_to_end(tmp_path, arch):
     out = str(tmp_path / "flow")
     kwargs = (dict(hidden_dims=[16, 16]) if arch == "zuko_nsf" else
               dict(arch_kwargs=dict(num_layers=3, hidden_sizes=[16, 16], num_bins=6)))
-    flow, hist = astro.train_astro_flow(
+    flow, hist = train.train_astro_flow(
         ts, out, val=(2, 10), steps=300, batch_size=64, save_freq=100, mode="flat",
         backend="flax", architecture=arch,
         train_kwargs=dict(learning_rate=3e-3, seed=0, val_ndraws=2000, progress_bar=False,
@@ -293,18 +293,18 @@ def test_architectures_reach_similar_fits(tmp_path):
     from holodeck.constants import YR
 
     holodeck.log.setLevel(logging.WARNING)
-    ps = astro.pandora_phenom_param_space(nsamples=24, sam_shape=10, seed=0)
-    ts = astro.generate_training_set(ps, str(tmp_path / "set"), 20 * YR, n_real=200, seed=0)
+    ps = trainset.pandora_phenom_param_space(nsamples=24, sam_shape=10, seed=0)
+    ts = trainset.generate_training_set(ps, str(tmp_path / "set"), 20 * YR, n_real=200, seed=0)
 
     def subset(sl):
-        return astro.TrainingSet(params=ts.params, log10_rho=np.asarray(ts.log10_rho)[:, sl],
+        return trainset.TrainingSet(params=ts.params, log10_rho=np.asarray(ts.log10_rho)[:, sl],
                                  param_names=ts.param_names, f_conv=ts.f_conv, tspan=ts.tspan)
 
-    train, held = subset(slice(0, 150)), subset(slice(150, 200))
+    train_set, held = subset(slice(0, 150)), subset(slice(150, 200))
     nll = {}
     for arch, kw in [("zuko_nsf", dict(bins=8, hidden_features=[64, 64], transforms=3)),
                      ("coupling_rqs", dict(num_layers=4, hidden_sizes=[64, 64], num_bins=8))]:
-        flow, _ = astro.train_astro_flow(train, str(tmp_path / arch), steps=3000, batch_size=256,
+        flow, _ = train.train_astro_flow(train_set, str(tmp_path / arch), steps=3000, batch_size=256,
                                          save_freq=1000, mode="flat", backend="flax",
                                          architecture=arch, arch_kwargs=kw, seed=1,
                                          train_kwargs=dict(learning_rate=2e-3, seed=0,
@@ -320,7 +320,7 @@ def test_architectures_reach_similar_fits(tmp_path):
 def _zuko():
     torch = pytest.importorskip("torch")
     pytest.importorskip("zuko")
-    from ATLAS.experimental import zuko_flows as zf
+    from ATLAS.astro.flows import zuko as zf
     return torch, zf
 
 
@@ -450,7 +450,7 @@ def test_train_astro_flow_flax_on_gpu(tmp_path):
     if jax.default_backend() != "gpu":
         pytest.skip("needs JAX on a GPU")
     ts = _small_set()
-    flow, hist = astro.train_astro_flow(
+    flow, hist = train.train_astro_flow(
         ts, str(tmp_path / "flow"), val=(2, 10), steps=300, batch_size=64, save_freq=100,
         mode="flat", backend="flax", hidden_dims=[32, 32],
         train_kwargs=dict(learning_rate=3e-3, seed=0, val_ndraws=2000, progress_bar=False,

@@ -1,4 +1,4 @@
-"""Flow training and evaluation (zuko_flows.py, astro.train_astro_flow) against Pandora.
+"""Flow training and evaluation (zuko_flows.py, train.train_astro_flow) against Pandora.
 
 The reference is Pandora's own ``pandora.nf_dist`` (NFMaker, DataSplitter,
 ValidationHell, NFastroinference) plus the notebook training loop copied into
@@ -20,9 +20,9 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("zuko")
 nf_dist = pytest.importorskip("pandora.nf_dist")
 
-from ATLAS.experimental import astro  # noqa: E402
-from ATLAS.experimental import flow_utils as fu  # noqa: E402
-from ATLAS.experimental import zuko_flows as zf  # noqa: E402
+from ATLAS.astro.flows import train, trainset  # noqa: E402
+from ATLAS.astro.flows import utils as fu  # noqa: E402
+from ATLAS.astro.flows import zuko as zf  # noqa: E402
 from tests.pandora_reference import notebook_flow  # noqa: E402
 
 pytestmark = pytest.mark.astro
@@ -46,7 +46,7 @@ def physical_set():
     rng = np.random.default_rng(1)
     params = rng.normal(size=(N_DRAWS, N_P)) + np.array([3.0, -2.5])
     rho = -8 + 0.3 * rng.normal(size=(N_DRAWS, N_REAL, N_F)) + 0.1 * params[:, None, :1]
-    return astro.TrainingSet(params=params, log10_rho=rho, param_names=["a", "b"])
+    return trainset.TrainingSet(params=params, log10_rho=rho, param_names=["a", "b"])
 
 
 def _state_equal(a, b):
@@ -57,13 +57,13 @@ def _state_equal(a, b):
 # ---- splitting and batches ---------------------------------------------------------
 
 def test_split_matches_datasplitter(physical_set):
-    train, val = physical_set.split(4, 6, seeds=(3, 7))
+    train_set, val = physical_set.split(4, 6, seeds=(3, 7))
     p_train, p_val = nf_dist.DataSplitter.splitter_mesh(physical_set.log10_rho,
                                                          np.array([4, 6]), (3, 7))
     q_train, q_val = nf_dist.DataSplitter.splitter(physical_set.params, 4, 3)
-    assert np.array_equal(train.log10_rho, p_train) and np.array_equal(val.log10_rho, p_val)
-    assert np.array_equal(train.params, q_train) and np.array_equal(val.params, q_val)
-    assert set(train.draw_indices).isdisjoint(val.draw_indices)
+    assert np.array_equal(train_set.log10_rho, p_train) and np.array_equal(val.log10_rho, p_val)
+    assert np.array_equal(train_set.params, q_train) and np.array_equal(val.params, q_val)
+    assert set(train_set.draw_indices).isdisjoint(val.draw_indices)
 
 
 def _nfmaker(inputs, context, tmp_path, **kw):
@@ -280,10 +280,10 @@ def _end_to_end(tmp_path, device, nf_type="rho|theta"):
     from holodeck.constants import YR
 
     holodeck.log.setLevel(logging.WARNING)
-    ps = astro.pandora_phenom_param_space(nsamples=8, sam_shape=10, seed=0)
-    ts = astro.generate_training_set(ps, str(tmp_path / "set"), 20 * YR, n_real=60, seed=0)
+    ps = trainset.pandora_phenom_param_space(nsamples=8, sam_shape=10, seed=0)
+    ts = trainset.generate_training_set(ps, str(tmp_path / "set"), 20 * YR, n_real=60, seed=0)
     out = str(tmp_path / "flow")
-    flow, hist = astro.train_astro_flow(
+    flow, hist = train.train_astro_flow(
         ts, out, nf_type=nf_type, val=(2, 10) if nf_type != "theta|rho" else None,
         steps=300, batch_size=32, save_freq=100, mode="flat", device=device,
         hidden_dims=HIDDEN, train_kwargs=dict(learning_rate=3e-3, seed=0, val_ndraws=2000,
@@ -292,7 +292,7 @@ def _end_to_end(tmp_path, device, nf_type="rho|theta"):
     reloaded = zf.ZukoAstroFlow.load(out, device=device)
     rho, theta = ts.log10_rho[:, 0], ts.params
     assert np.array_equal(reloaded.log_prob(rho, theta), flow.log_prob(rho, theta))
-    assert reloaded.metadata["param_names"] == list(astro.PANDORA_PHENOM_PARAM_NAMES)
+    assert reloaded.metadata["param_names"] == list(trainset.PANDORA_PHENOM_PARAM_NAMES)
     ckpt = zf.ZukoAstroFlow.load(out, device=device, state="flow_299steps.pt")
     assert np.array_equal(ckpt.log_prob(rho, theta), flow.log_prob(rho, theta))
     if nf_type != "theta|rho":

@@ -85,26 +85,106 @@ def test_core_imports_without(blocked):
         f"blocking {blocked} broke the core:\n{r.stdout}\n{r.stderr[-2000:]}")
 
 
+ASTRO_LIGHT = [
+    "ATLAS.astro",
+    "ATLAS.astro.utils",
+    "ATLAS.astro.inference",
+    "ATLAS.astro.flows",
+    "ATLAS.astro.flows.trainset",
+    "ATLAS.astro.flows.train",
+    "ATLAS.astro.flows.utils",
+]
+
+
 def test_astro_imports_without_its_extra():
-    """ATLAS.experimental.astro imports holodeck, h5py, the zuko flows and
-    PTMCMCSampler lazily, so the module loads without the [astro] extra."""
+    '''
+
+    The astro modules other than the flows themselves import holodeck, h5py,
+    torch, zuko and PTMCMCSampler lazily, so they load without the [astro]
+    extra.
+
+    Arguments
+    ------------------------------
+    None
+
+    Returns
+    ------------------------------
+    None
+
+    '''
     r = _import_with_blocked(("holodeck", "h5py", "torch", "zuko", "PTMCMCSampler"),
-                             mods=["ATLAS.experimental.astro", "ATLAS.experimental.astro_utils",
-                                   "ATLAS.experimental.flow_utils"])
+                             mods=ASTRO_LIGHT)
     assert r.returncode == 0, f"{r.stdout}\n{r.stderr[-2000:]}"
+
+
+def test_astro_package_imports_nothing_heavy():
+    '''
+
+    Importing the astro packages and their light modules loads none of the
+    optional heavy dependencies (holodeck, torch, flax).
+
+    Arguments
+    ------------------------------
+    None
+
+    Returns
+    ------------------------------
+    None
+
+    '''
+    code = ("import sys\n"
+            + "".join(f"import {m}\n" for m in ASTRO_LIGHT)
+            + "heavy = [m for m in ('holodeck', 'torch', 'flax', 'zuko', 'PTMCMCSampler') "
+              "if m in sys.modules]\n"
+              "assert not heavy, heavy\n")
+    r = subprocess.run([sys.executable, "-c", code], cwd=str(ROOT), capture_output=True, text=True,
+                       env={"JAX_PLATFORMS": "cpu", "PATH": "/usr/bin:/bin", "HOME": str(Path.home())})
+    assert r.returncode == 0, r.stderr[-2000:]
 
 
 def test_flax_flows_import_without_torch():
-    """The JAX flows need flax, optax and distrax but not torch or zuko."""
-    r = _import_with_blocked(("torch", "zuko"), mods=["ATLAS.experimental.flax_flows"])
+    '''
+
+    The JAX flows need flax, optax and distrax but not torch or zuko. The
+    module is named ``flax.py`` inside ``ATLAS.astro.flows``; its absolute
+    ``from flax import nnx`` must still resolve to the real flax package.
+
+    Arguments
+    ------------------------------
+    None
+
+    Returns
+    ------------------------------
+    None
+
+    '''
+    r = _import_with_blocked(("torch", "zuko"), mods=["ATLAS.astro.flows.flax"])
     assert r.returncode == 0, f"{r.stdout}\n{r.stderr[-2000:]}"
+    code = ("import flax.nnx\n"
+            "from ATLAS.astro.flows import flax as ff\n"
+            "assert ff.nnx is flax.nnx, ff.nnx\n")
+    r = subprocess.run([sys.executable, "-c", code], cwd=str(ROOT), capture_output=True, text=True,
+                       env={"JAX_PLATFORMS": "cpu", "PATH": "/usr/bin:/bin", "HOME": str(Path.home())})
+    assert r.returncode == 0, r.stderr[-2000:]
 
 
 def test_import_does_not_initialize_a_device():
-    """Importing ATLAS must not start a JAX backend. joblib workers import
-    ATLAS.experimental.astro just to unpickle their task; if the import
-    created an array, each worker would claim the GPU."""
-    code = ("import ATLAS.experimental.astro\n"
+    '''
+
+    Importing ATLAS must not start a JAX backend. joblib workers import
+    ``ATLAS.astro.flows.trainset`` just to unpickle their task; if the import
+    created an array, each worker would claim the GPU.
+
+    Arguments
+    ------------------------------
+    None
+
+    Returns
+    ------------------------------
+    None
+
+    '''
+    code = ("import ATLAS.astro.flows.trainset\n"
             "from jax._src import xla_bridge\n"
             "assert not xla_bridge._backends, list(xla_bridge._backends)\n")
     r = subprocess.run([sys.executable, "-c", code], cwd=str(ROOT),

@@ -4,10 +4,10 @@ Conditional normalizing flows for astrophysical GWB inference, on zuko (torch).
 This is the port of Pandora's ``nf_dist.py``. The flows are zuko neural
 spline flows (``zuko.flows.spline.NSF`` with coupling transforms,
 ``passes=2``), trained on the normalized training sets from
-:mod:`ATLAS.experimental.astro`:
+:mod:`ATLAS.astro.flows.trainset`:
 
 * :func:`make_zuko_flow` builds the flow Pandora builds.
-* :class:`~ATLAS.experimental.flow_utils.BatchSampler` (re-exported here)
+* :class:`~ATLAS.astro.flows.utils.BatchSampler` (re-exported here)
   draws training batches the way Pandora does: ``'diagonal'`` and ``'mesh'``
   (``NFMaker.sample_from_dist``) or ``'flat'`` (the training loop in
   ``AstroInferenceUpdated.ipynb``).
@@ -18,7 +18,7 @@ spline flows (``zuko.flows.spline.NSF`` with coupling transforms,
   trained flow in physical units.
 
 Given the same seeds, training reproduces Pandora's weights bit for bit.
-Stage 2 of the port reimplements these flows in flax (``flax_flows.py``).
+``ATLAS.astro.flows.flax`` reimplements these flows in JAX.
 
 Differences from Pandora
 ------------------------
@@ -53,7 +53,7 @@ import torch
 import zuko
 from tqdm.auto import trange
 
-from ATLAS.experimental.flow_utils import (
+from ATLAS.astro.flows.utils import (
     NF_TYPES,
     BatchSampler,
     HellingerMonitor,
@@ -326,7 +326,7 @@ class ZukoAstroFlow:
         reverse. ``'rho'``: unconditional density of ``log10_rho``.
     mapping : dict
         ``B``, ``mean``, ``half_range`` from
-        :meth:`ATLAS.experimental.astro.TrainingSet.normalization`: arrays of
+        :meth:`ATLAS.astro.flows.trainset.TrainingSet.normalization`: arrays of
         length ``n_params + n_freqs``, astrophysical parameters first.
     n_params : int
         Number of astrophysical parameters.
