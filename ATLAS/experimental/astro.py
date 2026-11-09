@@ -61,15 +61,24 @@ holodeck and h5py are imported lazily, so this module imports without the
 ``[astro]`` extra.
 """
 
-import glob
 import json
 import os
-import re
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import lru_cache
 
 import numpy as np
+
+from ATLAS.experimental.astro_utils import (
+    conversion_freqs,
+    default_tag,
+    draw_indices_on_disk,
+    draw_path,
+    gwb_bounds as _gwb_bounds,
+    metadata_path,
+    read_metadata,
+    simulate_and_save,
+)
 
 __all__ = [
     "PANDORA_PHENOM_DEFAULTS",
@@ -276,7 +285,7 @@ def gwb_frequencies(tspan, n_freqs, freqs=None):
     from holodeck import utils as hutils
 
     _, edges = hutils.pta_freqs(tspan, n_freqs)
-    return _conversion_freqs(freqs, tspan, n_freqs), edges
+    return conversion_freqs(freqs, tspan, n_freqs), edges
 
 
 
@@ -411,7 +420,7 @@ def generate_training_set(pspace, save_dir, tspan, n_freqs=5, n_real=10_000,
     from tqdm_joblib import tqdm_joblib
 
     os.makedirs(save_dir, exist_ok=True)
-    tag = tag or _default_tag(tspan)
+    tag = tag or default_tag(tspan)
     params = np.asarray(pspace.param_samples if params is None else params)
     if params.ndim != 2 or params.shape[1] != len(pspace.param_names):
         raise ValueError(f"params has shape {params.shape}, expected "
@@ -419,7 +428,7 @@ def generate_training_set(pspace, save_dir, tspan, n_freqs=5, n_real=10_000,
     sam_shape = pspace.sam_shape if sam_shape is None else sam_shape
     f_conv, _ = gwb_frequencies(tspan, n_freqs, freqs)
 
-    meta = _read_metadata(save_dir, tag)
+    meta = read_metadata(save_dir, tag)
     bad = set(meta.get("bad_indices", []))
     params_path = os.path.join(save_dir, PARAMS_FILE)
     if os.path.exists(params_path) and not overwrite:
@@ -431,12 +440,12 @@ def generate_training_set(pspace, save_dir, tspan, n_freqs=5, n_real=10_000,
 
     indices = range(len(params)) if indices is None else indices
     todo = [int(i) for i in indices
-            if overwrite or (not os.path.exists(_draw_path(save_dir, i, tag)) and i not in bad)]
+            if overwrite or (not os.path.exists(draw_path(save_dir, i, tag)) and i not in bad)]
 
     def draw_seed(i):
         return None if seed is None else seed + i
 
-    jobs = (delayed(_simulate_and_save)(pspace, i, params[i], _draw_path(save_dir, i, tag),
+    jobs = (delayed(simulate_and_save)(pspace, i, params[i], draw_path(save_dir, i, tag),
                                         tspan, n_freqs, n_real, freqs, draw_seed(i), sam_shape)
             for i in todo)
     with tqdm_joblib(desc="GWB draws", total=len(todo)):
@@ -461,7 +470,7 @@ def generate_training_set(pspace, save_dir, tspan, n_freqs=5, n_real=10_000,
         holodeck_version=holo_version,
         bad_indices=sorted(bad),
     )
-    with open(_metadata_path(save_dir, tag), "w") as fh:
+    with open(metadata_path(save_dir, tag), "w") as fh:
         json.dump(meta, fh, indent=2)
 
     return combine_training_set(save_dir, tag) if combine else None
@@ -479,17 +488,17 @@ def combine_training_set(save_dir, tag):
     -------
     TrainingSet
     """
-    indices = _draw_indices_on_disk(save_dir, tag)
+    indices = draw_indices_on_disk(save_dir, tag)
     if indices.size == 0:
         raise FileNotFoundError(f"no '*_{tag}.npy' draws in {save_dir}")
-    first = np.load(_draw_path(save_dir, indices[0], tag))
+    first = np.load(draw_path(save_dir, indices[0], tag))
     n_f, n_real = first.shape
     out = np.lib.format.open_memmap(
         os.path.join(save_dir, f"gwb_spectrum_samples_{tag}.npy"),
         mode="w+", dtype="float64", shape=(len(indices), n_real, n_f),
         fortran_order=False)
     for row, idx in enumerate(indices):
-        out[row] = np.load(_draw_path(save_dir, idx, tag)).T
+        out[row] = np.load(draw_path(save_dir, idx, tag)).T
     out.flush()
     del out
     return TrainingSet.from_pandora_files(save_dir, tag, indices=indices)
@@ -559,11 +568,11 @@ class TrainingSet:
         rho = np.load(os.path.join(save_dir, f"gwb_spectrum_samples_{tag}.npy"), mmap_mode="r")
         all_params = np.load(os.path.join(save_dir, params_file))
         if indices is None:
-            indices = _draw_indices_on_disk(save_dir, tag)
+            indices = draw_indices_on_disk(save_dir, tag)
             if indices.size != rho.shape[0]:
                 indices = np.arange(rho.shape[0])
         indices = np.asarray(indices, dtype=int)
-        meta = _read_metadata(save_dir, tag)
+        meta = read_metadata(save_dir, tag)
         names = meta.get("param_names", [f"param_{i}" for i in range(all_params.shape[1])])
         f_conv = np.asarray(meta["f_conv"]) if "f_conv" in meta else None
         return cls(params=all_params[indices], log10_rho=rho, param_names=list(names),
@@ -697,20 +706,22 @@ class TrainingSet:
 def train_astro_flow(training_set, save_dir, nf_type="rho|theta", B=5, val=None,
                      split_seeds=(0, 1), steps=10_000, batch_size=512, save_freq=1_000,
                      mode="diagonal", device=None, spline_bins=8, hidden_dims=(512, 512),
-                     transforms=3, train_kwargs=None):
+                     transforms=3, train_kwargs=None, backend="zuko", architecture="zuko_nsf",
+                     arch_kwargs=None, seed=0):
     """
     Train a conditional flow on a training set (Pandora's full training path).
 
     Normalizes ``training_set`` to ``[-B, B]`` (the same map Pandora saves in
     ``*_mapping_data.npy.npz``), optionally holds out a validation set for
-    Hellinger-distance early stopping, trains a zuko NSF, and saves it.
+    Hellinger-distance early stopping, trains a flow, and saves it.
 
     Parameters
     ----------
     training_set : TrainingSet
     save_dir : str
-        Receives checkpoints, ``flow_config.json`` and the final
-        ``flow_state.pt``; reload with ``ZukoAstroFlow.load(save_dir)``.
+        Receives checkpoints, ``flow_config.json`` and the final weights;
+        reload with ``ZukoAstroFlow.load(save_dir)`` or
+        ``FlaxAstroFlow.load(save_dir)``.
     nf_type : {'rho|theta', 'theta|rho', 'rho'}
     B : float
     val : (n_val_draws, n_val_real) or None
@@ -722,20 +733,35 @@ def train_astro_flow(training_set, save_dir, nf_type="rho|theta", B=5, val=None,
         loop in ``AstroInferenceUpdated.ipynb``.
     device, spline_bins, hidden_dims, transforms
         See ``zuko_flows.FlowTrainer``. The notebook uses
-        ``hidden_dims=[512] * 8``.
+        ``hidden_dims=[512] * 8``. With ``backend='flax'`` and
+        ``architecture='zuko_nsf'`` they define the same flow in JAX (and
+        ``device`` is ignored: JAX uses its default device).
     train_kwargs : dict, optional
-        Further ``FlowTrainer.train`` arguments (``learning_rate``, ``seed``,
+        Further ``train`` arguments (``learning_rate``, ``seed``,
         ``patience``, ...).
+    backend : {'zuko', 'flax'}
+        Train with torch (``zuko_flows.FlowTrainer``) or JAX
+        (``flax_flows.FlaxFlowTrainer``).
+    architecture : {'zuko_nsf', 'coupling_rqs'}
+        Flax architecture (``backend='flax'`` only).
+    arch_kwargs : dict, optional
+        Flax architecture arguments; for ``'zuko_nsf'`` they default to
+        ``spline_bins``, ``hidden_dims`` and ``transforms``.
+    seed : int
+        Weight initialization for ``backend='flax'`` (the zuko backend
+        follows ``torch.manual_seed``).
 
     Returns
     -------
-    flow : zuko_flows.ZukoAstroFlow
+    flow : zuko_flows.ZukoAstroFlow or flax_flows.FlaxAstroFlow
     history : dict
     """
-    from ATLAS.experimental import zuko_flows as zf
+    from ATLAS.experimental.flow_utils import NF_TYPES
 
-    if nf_type not in zf.NF_TYPES:
-        raise ValueError(f"nf_type must be one of {zf.NF_TYPES}, got {nf_type!r}")
+    if backend not in ("zuko", "flax"):
+        raise ValueError(f"backend must be 'zuko' or 'flax', got {backend!r}")
+    if nf_type not in NF_TYPES:
+        raise ValueError(f"nf_type must be one of {NF_TYPES}, got {nf_type!r}")
     mapping = training_set.normalization(B)
     if val is not None:
         if nf_type == "theta|rho":
@@ -762,14 +788,29 @@ def train_astro_flow(training_set, save_dir, nf_type="rho|theta", B=5, val=None,
                     param_names=list(training_set.param_names),
                     f_conv=None if training_set.f_conv is None else list(training_set.f_conv),
                     tspan=training_set.tspan)
-    trainer = zf.FlowTrainer(inputs, context, save_dir, B, device=device,
-                             spline_bins=spline_bins, hidden_dims=hidden_dims,
-                             transforms=transforms, metadata=metadata)
-    history = trainer.train(steps, batch_size, save_freq, mode=mode, validation=validation,
-                            **(train_kwargs or {}))
-    flow = zf.ZukoAstroFlow(trainer.flow, nf_type, mapping, training_set.n_params,
-                            device=trainer.device,
-                            metadata={k: metadata[k] for k in ("param_names", "f_conv", "tspan")})
+    flow_meta = {k: metadata[k] for k in ("param_names", "f_conv", "tspan")}
+    if backend == "flax":
+        from ATLAS.experimental import flax_flows as ff
+
+        if arch_kwargs is None and architecture == "zuko_nsf":
+            arch_kwargs = dict(bins=spline_bins, hidden_features=list(hidden_dims),
+                               transforms=transforms)
+        trainer = ff.FlaxFlowTrainer(inputs, context, save_dir, B, architecture=architecture,
+                                     arch_kwargs=arch_kwargs, metadata=metadata, seed=seed)
+        history = trainer.train(steps, batch_size, save_freq, mode=mode, validation=validation,
+                                **(train_kwargs or {}))
+        flow = ff.FlaxAstroFlow(trainer.model, nf_type, mapping, training_set.n_params,
+                                metadata=flow_meta)
+    else:
+        from ATLAS.experimental import zuko_flows as zf
+
+        trainer = zf.FlowTrainer(inputs, context, save_dir, B, device=device,
+                                 spline_bins=spline_bins, hidden_dims=hidden_dims,
+                                 transforms=transforms, metadata=metadata)
+        history = trainer.train(steps, batch_size, save_freq, mode=mode, validation=validation,
+                                **(train_kwargs or {}))
+        flow = zf.ZukoAstroFlow(trainer.flow, nf_type, mapping, training_set.n_params,
+                                device=trainer.device, metadata=flow_meta)
     flow.save(save_dir)
     return flow, history
 
@@ -813,7 +854,7 @@ def load_holodeck_library(path, n_freqs, tspan=None, freqs=None, hc_floor=1e-20)
         if edges is None:
             raise ValueError("library has no 'fobs_edges'; pass tspan")
         tspan = 1.0 / (edges[1] - edges[0])
-    f_conv = _conversion_freqs(freqs, tspan, n_freqs)
+    f_conv = conversion_freqs(freqs, tspan, n_freqs)
 
     if hc_floor is not None:
         hc[hc < hc_floor] = hc_floor
@@ -1301,65 +1342,8 @@ class AstroInferenceModel:
 #############################################
 
 def __getattr__(name):
+    # Lazy class lookup; must live in this module so PS_Pandora_Phenom
+    # instances pickle by reference (joblib workers).
     if name == "PS_Pandora_Phenom":
         return _pandora_phenom_class()
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-def _conversion_freqs(freqs, tspan, n_freqs):
-    if freqs is None:
-        return np.arange(1 / tspan, (n_freqs + .001) / tspan, 1 / tspan)
-    if isinstance(freqs, str):
-        raise ValueError(f"freqs must be None or an array, got {freqs!r}")
-    f = np.asarray(freqs, dtype=np.float64)
-    if f.shape != (n_freqs,):
-        raise ValueError(f"freqs array has shape {f.shape}, expected ({n_freqs},)")
-    return f
-
-def _default_tag(tspan):
-    from holodeck.constants import YR
-
-    return f"{round(tspan / YR, 6):g}yrs"
-
-
-def _metadata_path(save_dir, tag):
-    return os.path.join(save_dir, f"trainset_{tag}_metadata.json")
-
-
-def _draw_path(save_dir, idx, tag):
-    return os.path.join(save_dir, f"{idx}_{tag}.npy")
-
-
-def _read_metadata(save_dir, tag):
-    path = _metadata_path(save_dir, tag)
-    if not os.path.exists(path):
-        return {}
-    with open(path) as fh:
-        return json.load(fh)
-
-
-def _draw_indices_on_disk(save_dir, tag):
-    pattern = re.compile(rf"^(\d+)_{re.escape(tag)}\.npy$")
-    found = (pattern.match(os.path.basename(p))
-             for p in glob.glob(os.path.join(save_dir, f"*_{tag}.npy")))
-    return np.array(sorted(int(m.group(1)) for m in found if m), dtype=int)
-
-
-def _simulate_and_save(pspace, idx, params, path, tspan, n_freqs, n_real, freqs,
-                       seed, sam_shape):
-    rho = simulate_log10_rho(pspace, params, tspan, n_freqs, n_real, freqs=freqs,
-                             seed=seed, sam_shape=sam_shape)
-    if not np.isfinite(rho).all():
-        return idx, False
-    np.save(path, rho)
-    return idx, True
-
-def _gwb_bounds(gwb_psd_function, gwb_bounds, rho_bounds, crn_bins):
-    """GWB PSD prior bounds: given, or ``rho_bounds`` per bin for a free spectrum."""
-    import jax.numpy as jnp
-    from ATLAS.psd_functions import gwb_free_spectrum
-
-    if gwb_bounds is not None:
-        return jnp.asarray(gwb_bounds[0]), jnp.asarray(gwb_bounds[1])
-    if gwb_psd_function is not gwb_free_spectrum:
-        raise ValueError("gwb_bounds is required unless the GWB PSD is gwb_free_spectrum")
-    return jnp.full(crn_bins, float(rho_bounds[0])), jnp.full(crn_bins, float(rho_bounds[1]))

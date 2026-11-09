@@ -57,14 +57,18 @@ experimental = [
 # ATLAS/experimental/astro.py and zuko_flows.py: hierarchical astrophysical
 # inference of the GWB (ported from Pandora). holodeck simulates the training
 # sets; h5py reads holodeck librarian libraries; torch and zuko train the
-# flows; PTMCMCSampler samples the hierarchical posterior. The differentiable
-# flows will add flax, optax and distrax.
+# flows (zuko_flows.py); PTMCMCSampler samples the hierarchical posterior;
+# flax, optax and distrax build and train the differentiable flows
+# (flax_flows.py).
 astro = [
     "holodeck-gw",
     "h5py",
     "torch",
     "zuko",
     "ptmcmcsampler",
+    "flax",
+    "optax",
+    "distrax",
 ]
 
 [tool.setuptools.packages.find]

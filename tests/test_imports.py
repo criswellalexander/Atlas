@@ -89,7 +89,14 @@ def test_astro_imports_without_its_extra():
     """ATLAS.experimental.astro imports holodeck, h5py, the zuko flows and
     PTMCMCSampler lazily, so the module loads without the [astro] extra."""
     r = _import_with_blocked(("holodeck", "h5py", "torch", "zuko", "PTMCMCSampler"),
-                             mods=["ATLAS.experimental.astro"])
+                             mods=["ATLAS.experimental.astro", "ATLAS.experimental.astro_utils",
+                                   "ATLAS.experimental.flow_utils"])
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr[-2000:]}"
+
+
+def test_flax_flows_import_without_torch():
+    """The JAX flows need flax, optax and distrax but not torch or zuko."""
+    r = _import_with_blocked(("torch", "zuko"), mods=["ATLAS.experimental.flax_flows"])
     assert r.returncode == 0, f"{r.stdout}\n{r.stderr[-2000:]}"
 
 

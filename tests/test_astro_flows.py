@@ -21,6 +21,7 @@ pytest.importorskip("zuko")
 nf_dist = pytest.importorskip("pandora.nf_dist")
 
 from ATLAS.experimental import astro  # noqa: E402
+from ATLAS.experimental import flow_utils as fu  # noqa: E402
 from ATLAS.experimental import zuko_flows as zf  # noqa: E402
 from tests.pandora_reference import notebook_flow  # noqa: E402
 
@@ -81,7 +82,7 @@ def test_batches_match_nfmaker(data, tmp_path, swap, mode, rep_in, rep_ctx):
     random.seed(5)
     expected = [m.sample_from_dist(4, m.chain_input, m.chain_context, rep_in, rep_ctx, mode)
                 for _ in range(10)]
-    sampler = zf.BatchSampler(m.chain_input, m.chain_context, 4, mode=mode, repeat_input=rep_in,
+    sampler = fu.BatchSampler(m.chain_input, m.chain_context, 4, mode=mode, repeat_input=rep_in,
                               repeat_context=rep_ctx, rng=random.Random(5))
     for x_ref, c_ref in expected:
         x, c = sampler()
@@ -94,7 +95,7 @@ def test_flat_batches_match_notebook(data):
     flat_theta = torch.tensor(np.repeat(theta[:, None], N_REAL, axis=1).reshape(-1, N_P))
     random.seed(9)
     rows = [random.sample(range(N_DRAWS * N_REAL), k=16) for _ in range(10)]
-    sampler = zf.BatchSampler(torch.tensor(rho), torch.tensor(theta), 16, mode="flat",
+    sampler = fu.BatchSampler(torch.tensor(rho), torch.tensor(theta), 16, mode="flat",
                               rng=random.Random(9))
     for r in rows:
         x, c = sampler()
@@ -147,18 +148,18 @@ def test_hellinger_matches_validationhell(tmp_path):
     vh = nf_dist.ValidationHell(str(tmp_path / "Hell.pdf"), "cpu")
     ref_hist = np.asarray(vh.batched_histogram(jnp.asarray(val), jnp.asarray(lower),
                                                jnp.asarray(upper), bins=15))
-    hist = zf._batched_histogram(val, lower, upper, 15)
+    hist = fu.batched_histogram(val, lower, upper, 15)
     assert np.array_equal(hist, ref_hist)
 
     # a sequence of flow-sample sets that drifts towards the validation set
     gens = [rng.normal(loc=mu, size=(6, 2000)) for mu in (0.8, 0.4, 0.2, 0.19, 0.18, 0.18)]
     vh.plot_hell_dist = lambda: None
-    monitor = zf._HellingerMonitor()
+    monitor = fu.HellingerMonitor()
     for gen in gens:
         vh.sample_from_nf = lambda *a, gen=gen, **k: jnp.asarray(gen)
         ref_dec = vh.make_decision(jnp.asarray(ref_hist), None, 2000, 1, jnp.asarray(lower),
                                    jnp.asarray(upper), None, progress_bar=False)
-        hell = zf._hellinger(hist, zf._batched_histogram(gen, lower, upper, 15))
+        hell = fu.hellinger(hist, fu.batched_histogram(gen, lower, upper, 15))
         assert np.allclose(hell, vh.hell[-1], rtol=1e-12, atol=0)
         assert monitor.update(hell) == ref_dec
     assert monitor.ll == vh.ll and monitor.ul == vh.ul
