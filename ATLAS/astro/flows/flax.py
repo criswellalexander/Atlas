@@ -11,7 +11,7 @@ Two architectures are available:
   (:class:`ZukoRQS`, a distrax bijector). A trained zuko or Pandora flow
   converts with :meth:`FlaxAstroFlow.from_zuko` and evaluates to the same
   density up to rounding.
-* :class:`CouplingRQSFlow` is Pelargir's architecture: distrax
+* :class:`CouplingRQSFlow` is based on the flow architecture in PELARGIR (Criswell+26): distrax
   ``MaskedCoupling`` layers with ``RationalQuadraticSpline`` bijectors whose
   conditioners start at zero, so an untrained flow is its base distribution.
 
@@ -23,9 +23,6 @@ but gathering them on the device and running the steps between checkpoints
 as one ``lax.scan`` (Pelargir's training loop), so GPU training is not bound
 by per-step dispatch.
 
-The modules follow Pelargir's conventions: an NNX module is passed into pure
-functions rather than closed over, and parameters are saved as a path-keyed
-npz next to a JSON config.
 """
 
 import json
