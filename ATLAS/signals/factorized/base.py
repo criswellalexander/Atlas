@@ -759,8 +759,9 @@ class SuperSignal:
     """Assembles several signals into one likelihood over a shared T-matrix.
 
     Takes a list of component signals (``'unc'`` intrinsic red noise, ``'cor'``
-    correlated GWB, ``'dm'`` DM noise, ``'gtm'`` Gaussian timing model,
-    ``'det'`` deterministic) plus a combination string describing which of them
+    correlated GWB or ``'astro'`` GWB with an astrophysical prior, ``'dm'`` DM
+    noise, ``'gtm'`` Gaussian timing model, ``'det'`` deterministic) plus a
+    combination string describing which of them
     share basis columns, concatenates their bases (optionally prefixed by the
     linear timing-model design matrix), builds the matching
     ``parameterized`` covariance model, and exposes the log-posteriors that
@@ -774,8 +775,17 @@ class SuperSignal:
     Attributes
     ----------
     signal_map : dict[str, signal]
-        Component signals by name; ``has_unc`` / ``has_cor`` / ``has_dm`` /
-        ``has_gtm`` / ``has_det`` mirror its keys.
+        Component signals by name; ``has_unc`` / ``has_cor`` / ``has_astro``
+        / ``has_dm`` / ``has_gtm`` / ``has_det`` mirror its keys.
+    common_name : str or None
+        Name of the single common (correlated) process, ``'cor'`` or
+        ``'astro'``; None without one.  ``has_common`` is its truth value.
+    astro_signal : AstroGWB or None
+        The ``'astro'`` signal, whose flow prior ``model_maker`` (in
+        ``ATLAS.model``) adds to the joint density.
+    common_param_slice : slice
+        Position of the astro free-spectrum amplitudes in the ``red_noise``
+        vector (only set when ``has_astro``).
     get_Fmat_concat : array, [n_toas, nmodes]
         The assembled T-matrix, ``[timing | shared block | separate blocks]``.
         A ``dm`` block carries the DM chromatic index: each TOA's row is
@@ -859,9 +869,17 @@ class SuperSignal:
             raise ValueError(
                 "signal_list contains duplicate names; the later signal would "
                 f"silently replace the earlier one: {[s.name for s in signal_list]}")
-        for flag in ('unc', 'cor', 'dm', 'gtm', 'det'):
+        for flag in ('unc', 'cor', 'astro', 'dm', 'gtm', 'det'):
             setattr(self, f'has_{flag}', flag in self.signal_map)
         self.det_signal = self.signal_map['det'] if self.has_det else None
+        # One common process for now: the GWB is either 'cor' or 'astro'.
+        if self.has_cor and self.has_astro:
+            raise ValueError(
+                "'cor' and 'astro' together are not supported yet: the phi model "
+                "holds a single common process.")
+        self.common_name = 'cor' if self.has_cor else ('astro' if self.has_astro else None)
+        self.has_common = self.common_name is not None
+        self.astro_signal = self.signal_map['astro'] if self.has_astro else None
 
         self.get_Fmat_concat, self.signal_comb_idxs = self.build_basis(self.signal_combination_string, self.signal_map)
         self.chrom_idxs = self.signal_comb_idxs['dm'] if 'dm' in self.signal_comb_idxs.keys() else None
@@ -1239,8 +1257,9 @@ class SuperSignal:
 
         Collects each present component's PSD function, helper dictionary, bin
         count and frequencies, then instantiates
-        ``parameterized.CorrelatedPulsarRedNoise`` when a ``'cor'`` signal is
-        present and ``parameterized.PerPulsarRedNoise`` otherwise.  Also sets
+        ``parameterized.CorrelatedPulsarRedNoise`` when a common process
+        (``'cor'`` or ``'astro'``) is present and
+        ``parameterized.PerPulsarRedNoise`` otherwise.  Also sets
         ``self._phi_is_mode_resolved``, which tells the likelihoods whether phi
         rows are basis columns or frequency bins.
         """
@@ -1278,7 +1297,7 @@ class SuperSignal:
             model_kwargs['extra_components'] = [
                 self.signal_map[n].extra_component() for n in self.extra_names]
 
-        if not self.has_cor:
+        if not self.has_common:
             model_kwargs.update(dict(
                 Npulsars                 = self.data.npsrs,
                 signal_indices           = self.signal_comb_idxs,
@@ -1288,19 +1307,33 @@ class SuperSignal:
             self.model = partial(parameterized.PerPulsarRedNoise, **model_kwargs)()
             
         else:
+            common = self.signal_map[self.common_name]
             model_kwargs.update(dict(
                 psr_pos                  = self.data.psr_pos,
                 Npulsars                 = self.data.npsrs,
                 signal_indices           = self.signal_comb_idxs,
                 linear_timing_model_size = self.linear_timing_model_size,
-                gwb_psd_func             = self.signal_map['cor'].psd_function,
-                orf_func                 = self.signal_map['cor'].orf_function,
-                gwb_helper_dictionary    = self.signal_map['cor'].psd_reparam_helper,
-                crn_bins                 = self.signal_map['cor'].nfreqs,
-                f_common                 = self.signal_map['cor'].freqs,
+                gwb_psd_func             = common.psd_function,
+                orf_func                 = common.orf_function,
+                gwb_helper_dictionary    = common.psd_reparam_helper,
+                crn_bins                 = common.nfreqs,
+                f_common                 = common.freqs,
+                common_name              = self.common_name,
+                gwb_param_prefix         = common.param_prefix,
             )
             )
             self.model = partial(parameterized.CorrelatedPulsarRedNoise, **model_kwargs)()
+
+        if self.has_astro:
+            # The flow prior reads the free-spectrum amplitudes straight out of
+            # `red_noise`; they are log10_rho because SuperSignal never
+            # rescales the residuals (renorm_const = 1).
+            self.common_param_slice = slice(self.model.gtm_end_idx, self.model.gwb_psd_end_idx)
+            n_rho = self.model.gwb_psd_end_idx - self.model.gtm_end_idx
+            if n_rho != self.astro_signal.flow.n_freqs:
+                raise ValueError(
+                    f"the astro block samples {n_rho} amplitudes but its flow models "
+                    f"{self.astro_signal.flow.n_freqs} frequency bins")
 
         # phi comes back at basis-column (mode) resolution whenever the GTM
         # block is mode-resolved; otherwise it is at frequency-bin resolution
@@ -1469,7 +1502,7 @@ class SuperSignal:
         # it merges 'cor' straight back into one block. Indexing it here
         # unconditionally is what made every GWB-free model unusable from
         # a40d71a onward, single-pulsar noise runs included.
-        cor_idx = self.signal_comb_idxs.get('cor')
+        cor_idx = self.signal_comb_idxs.get(self.common_name)
         # 'P' is every non-GWB stochastic block: the linear timing model, the
         # intrinsic red noise, DM noise and the Adaptus basis, in column order.
         # `dm` was missing here, so with a `dm` block in the model string the
@@ -1540,15 +1573,17 @@ class SuperSignal:
     def partial_marg_lnposterior(self, helpers, red_params, z, D_params=None):
         """Public entry point — dispatches to the cached jitted implementation.
 
-        Requires a 'cor' block, unlike `lnposterior_reparam`. Checked here
+        Requires a common-process ('cor' or 'astro') block, unlike
+        `lnposterior_reparam`. Checked here
         rather than in `partial_marg_lnposterior_helper`, which
         `lnposterior_reparam_helper` shares and which must stay usable without
         one. Without this the failure is a `TypeError: 'NoneType' object is not
         subscriptable` from inside `block_slice`, several frames down.
         """
-        if self.signal_comb_idxs.get('cor') is None:
+        if self.signal_comb_idxs.get(self.common_name) is None:
             raise ValueError(
-                "partial_marg_lnposterior keeps the 'cor' (GWB) block and "
+                "partial_marg_lnposterior keeps the common-process ('cor' or "
+                "'astro') block and "
                 "marginalizes the rest analytically, so it requires one; model "
                 f"string {self.signal_combination_string!r} has none. Use "
                 "lnposterior_reparam instead."

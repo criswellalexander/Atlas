@@ -1333,7 +1333,10 @@ class CorrelatedPulsarRedNoise(_GTMModeMixin, _ExtraBlocksMixin):
         extra_components=None,
         # ---- shared ----
         renorm_const=1.0,
-        pulsar_names=None
+        pulsar_names=None,
+        # ---- naming of the common process ----
+        common_name='cor',
+        gwb_param_prefix='gwb',
     ):
         """
         Parameters
@@ -1342,8 +1345,9 @@ class CorrelatedPulsarRedNoise(_GTMModeMixin, _ExtraBlocksMixin):
             Unit position vectors; used only for the pair separations ``xi``.
         Npulsars : int
         signal_indices : dict[str, slice]
-            T-matrix column slices per signal (``'cor'`` required; ``'unc'`` /
-            ``'dm'`` / ``'gtm'`` as present), from ``SuperSignal.build_basis``.
+            T-matrix column slices per signal (``common_name`` required;
+            ``'unc'`` / ``'dm'`` / ``'gtm'`` as present), from
+            ``SuperSignal.build_basis``.
         linear_timing_model_size : int
             Leading timing-model columns, subtracted before converting column
             indices to frequency bins.
@@ -1355,7 +1359,7 @@ class CorrelatedPulsarRedNoise(_GTMModeMixin, _ExtraBlocksMixin):
             Bounds and fixed-parameter info for the GWB PSD and the ORF.
         crn_bins : int
             Number of common-process bins; must equal the width of
-            ``signal_indices['cor']``.
+            ``signal_indices[common_name]``.
         f_common : array, shape (crn_bins,)
         irn_psd_func, dm_psd_func, gtm_psd_func, and their
         ``*_helper_dictionary`` / ``*_bins`` / ``f_*`` companions : optional
@@ -1366,6 +1370,12 @@ class CorrelatedPulsarRedNoise(_GTMModeMixin, _ExtraBlocksMixin):
             One PSD value per GTM basis column.  See ``_GTMModeMixin``.
         renorm_const : float, default 1.0
         pulsar_names : list of str, optional
+        common_name : str, default 'cor'
+            Key of the common process in ``signal_indices`` (``'cor'``, or
+            ``'astro'`` for the astrophysical GWB).
+        gwb_param_prefix : str, default 'gwb'
+            Prefix of the common-process parameter names in
+            ``get_param_names``.
 
         Raises
         ------
@@ -1393,7 +1403,9 @@ class CorrelatedPulsarRedNoise(_GTMModeMixin, _ExtraBlocksMixin):
             stop_col  = sl.stop  - tm_offset
             return slice(start_col // 2, stop_col // 2)
 
-        self.GWB_slice     = _fourier_slice('cor')
+        self.common_name   = common_name
+        self.gwb_param_prefix = gwb_param_prefix
+        self.GWB_slice     = _fourier_slice(common_name)
         self.GWB_fidxs     = jnp.arange(self.GWB_slice.start, self.GWB_slice.stop)
         # `_eye` is built with crn_bins rows and is cho_solve'd against
         # phi[GWB_fidxs]; if the two disagree the failure is a batch-shape error
@@ -1401,7 +1413,7 @@ class CorrelatedPulsarRedNoise(_GTMModeMixin, _ExtraBlocksMixin):
         n_gwb_slice = self.GWB_slice.stop - self.GWB_slice.start
         if n_gwb_slice != crn_bins:
             raise ValueError(
-                f"crn_bins={crn_bins} but signal_indices['cor'] spans "
+                f"crn_bins={crn_bins} but signal_indices[{common_name!r}] spans "
                 f"{n_gwb_slice} frequency bins.")
         self.crn_bins      = crn_bins
 
@@ -1537,7 +1549,8 @@ class CorrelatedPulsarRedNoise(_GTMModeMixin, _ExtraBlocksMixin):
         self.KGW = jnp.repeat(self.GWB_fidxs[:, None], len(a), axis=1)
         # Rows of a GWB-only array (crn_bins, Np, Np): positions within the GWB
         # block, unlike KGW, whose absolute bins index the full red-noise grid.
-        # The two agree only when 'cor' starts at bin 0 (nested in 'unc').
+        # The two agree only when the common process starts at bin 0 (nested
+        # in 'unc').
         self.KGW_local = jnp.repeat(jnp.arange(crn_bins)[:, None], len(a), axis=1)
 
         if has_irn and self.separate_inversion_strat:
@@ -2216,8 +2229,9 @@ class CorrelatedPulsarRedNoise(_GTMModeMixin, _ExtraBlocksMixin):
             _x0 += 2 * blk.bins
 
         # phi_gwb holds only the GWB bins, so its rows are indexed locally
-        # (KGW_local). The absolute KGW would point past its end whenever 'cor'
-        # is a separate basis block, and JAX drops out-of-range scatters.
+        # (KGW_local). The absolute KGW would point past its end whenever the
+        # common process is a separate basis block, and JAX drops out-of-range
+        # scatters.
         phi_gwb = jnp.zeros((self.crn_bins, self.Npulsars, self.Npulsars))
         phi_gwb = phi_gwb.at[:, self.diag_idx, self.diag_idx].set(psd_common)
         phi_gwb = phi_gwb.at[self.KGW_local, self.I, self.J].set(orf_val * psd_common)
@@ -2362,7 +2376,7 @@ class CorrelatedPulsarRedNoise(_GTMModeMixin, _ExtraBlocksMixin):
         gwb_names = _psd_signature_names(self.gwb_psd_func, self.crn_bins)[
             np.asarray(self.gwb_varied_indxs)
         ]
-        names += [f"gwb_{p}" for p in gwb_names]
+        names += [f"{self.gwb_param_prefix}_{p}" for p in gwb_names]
 
         if not self.orf_fixed:
             orf_names = _orf_signature_names(self.orf_func)

@@ -199,3 +199,22 @@ def test_pulsar_module_is_the_one_that_needs_them():
     r = _import_with_blocked(("jug",), mods=["ATLAS.pulsar"])
     assert r.returncode != 0
     assert "jug" in r.stdout
+
+def test_core_and_astro_signal_import_without_flows():
+    '''
+
+    The core, including the `astro` signal module, imports without the flow
+    libraries or holodeck: `AstroGWB` imports the flows only when one is built.
+
+    Arguments
+    ------------------------------
+    None
+
+    Returns
+    ------------------------------
+    None
+
+    '''
+    r = _import_with_blocked(("flax", "distrax", "optax", "torch", "zuko", "holodeck"),
+                             mods=CORE + ["ATLAS.signals.correlated.astro_gwb"])
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr[-2000:]}"

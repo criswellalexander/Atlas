@@ -232,8 +232,10 @@ Signals are declared with a compact string passed to `make_red_noise`:
 ```
 
 Recognised names are `unc` (intrinsic red noise), `cor` (correlated background),
-`dm` (dispersion measure), `gtm` (Adaptus timing basis) and `det`
-(deterministic).
+`astro` (correlated background with an astrophysical population prior; see
+below), `dm` (dispersion measure), `gtm` (Adaptus timing basis) and `det`
+(deterministic). `astro` takes the place of `cor`; the two cannot yet be
+combined.
 
 No name is mandatory, `cor` included. A single-pulsar noise run wants a model
 with no correlated process at all — a common process cannot be separated from
@@ -281,6 +283,37 @@ curvature instead of an unbounded flat direction.
 This layout is hardcoded around the five signal names above. Adding a sixth
 requires edits in both `parameterized.py` classes as well as
 `signals/factorized/base.py`; replacing it with a component registry is planned.
+
+### Astrophysical GWB prior
+
+An `astro` block is a Hellings-Downs free-spectrum background whose amplitudes
+carry a hierarchical prior from a trained normalizing flow p(log10 rho | theta)
+(the Pandora approach). The astrophysical parameters theta are sampled with
+everything else. It needs the `[astro]` extra and a `'rho|theta'` flow, e.g. one
+trained with `ATLAS.astro.flows.train.train_astro_flow`:
+
+```python
+from ATLAS.astro.flows.flax import FlaxAstroFlow
+
+flow = FlaxAstroFlow.load("my_flow/")       # or a ZukoAstroFlow, converted to flax
+data.pta_tspan = flow.metadata["tspan"]     # the flow fixes the GWB frequencies
+rn = ModelBuilder(data=data).make_red_noise(
+    "ltm|unc+astro->unc", irn_psd_function=powerlaw,
+    irn_lower_bound_psd=..., irn_upper_bound_psd=...,
+    astro_flow=flow)
+mcmc.run(..., super_sig=rn, marg_over_non_gwb=True)
+```
+
+- The number of background bins is the flow's. `pta_tspan` must equal the
+  flow's training span, set before the model is built, since every Fourier
+  basis uses it. A mismatch raises.
+- By default, the uniform boxes on log10 rho (`gwb_lower/upper_bound_psd`) and
+  on theta (`astro_lower/upper_bound`) are the flow's training ranges.
+- `fixed_astro={index: value}` holds parameters fixed, and `astro_log_prior` adds
+  a JAX-traceable prior on the varied ones.
+- `model_maker` adds the site `astro_params` and the factor `astro_hyperprior`;
+  with `MultiHMCGibbs`, put `astro_params` in one of the groups.
+- The rho parameters are named `astro_halflog10_rho_i`.
 
 ## Timing model
 

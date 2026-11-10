@@ -131,6 +131,13 @@ def model_maker(raw_residuals,
 
     Notes
     -----
+    Astrophysical GWB (an ``'astro'`` block in ``super_sig``):
+        Adds the site ``'astro_params'`` (the varied astrophysical
+        parameters, uniform on the signal's ``astro_lower``/``astro_upper``;
+        absent when all are fixed) and the factor ``'astro_hyperprior'``,
+        the flow's log density of the free-spectrum amplitudes given them.
+        With ``MultiHMCGibbs``, list ``'astro_params'`` in one of the groups.
+
     The ``numpyro.factor`` cancellation:
         Both likelihoods return log p(data | z_a, ...) + terms in phi, but
         *not* log p(z_a).  NumPyro adds log p(z_a) = -0.5 sum(z_a**2) from
@@ -267,6 +274,16 @@ def model_maker(raw_residuals,
         'red_noise',
         dist.Uniform(super_sig.model.lower_prior_lim_all,
                      super_sig.model.upper_prior_lim_all))
+
+    # Hierarchical astrophysical prior on the free-spectrum GWB amplitudes:
+    # theta gets a uniform box, and the flow density p(log10_rho | theta)
+    # multiplies the uniform box already on log10_rho in `red_noise`.
+    if super_sig.has_astro:
+        astro = super_sig.astro_signal
+        theta = (numpyro.sample('astro_params', dist.Uniform(astro.astro_lower, astro.astro_upper))
+                 if astro.n_varied else jnp.zeros(0))
+        numpyro.factor('astro_hyperprior',
+                       astro.log_prior(xs[super_sig.common_param_slice], theta))
 
     # ------------------------------------------------------------------ #
     #  Deterministic signals                                                #
