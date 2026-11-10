@@ -14,6 +14,9 @@ import random
 from sklearn.decomposition import PCA
 from functools import cached_property
 
+# Dispersion delays scale as f^-2: the chromatic index a `dm` block is built with.
+DM_CHROM_INDEX = 2.0
+
 class Red:
     """Per-pulsar red-noise signal on a Fourier (sine/cosine) basis.
 
@@ -775,6 +778,10 @@ class SuperSignal:
         ``has_gtm`` / ``has_det`` mirror its keys.
     get_Fmat_concat : array, [n_toas, nmodes]
         The assembled T-matrix, ``[timing | shared block | separate blocks]``.
+        A ``dm`` block carries the DM chromatic index: each TOA's row is
+        scaled by ``(f_ref / f_radio)**DM_CHROM_INDEX``.
+    chrom_idxs : slice or None
+        Column slice of the ``dm`` block, or None without one.
     signal_comb_idxs : dict[str, slice]
         Column slice of each signal (plus ``'timing'``) within that matrix.
     nmodes : int
@@ -828,6 +835,17 @@ class SuperSignal:
         self.linear_timing = self.data.linear_timing
         self.marg_tm = self.data.marg
         self.Mmat = self.data.Mmat
+
+        # Linear, UN-marginalised timing needs its columns in the T-matrix;
+        # without `ltm|` every column offset below shifts by the timing width
+        # and the log-density comes out NaN instead of failing.
+        include_timing = sutils.parse_basis_string(signal_combination_string)['include_timing']
+        if self.linear_timing and not self.marg_tm and not include_timing:
+            raise ValueError(
+                "linear_timing=True with marg_timing=False needs the timing "
+                "columns in the T-matrix: prefix the combination string with "
+                f"'ltm|' (got {signal_combination_string!r}), or set "
+                "marg_timing=True.")
         
         # linear timing model attributes
         if self.marg_tm:
@@ -848,7 +866,28 @@ class SuperSignal:
         self.get_Fmat_concat, self.signal_comb_idxs = self.build_basis(self.signal_combination_string, self.signal_map)
         self.chrom_idxs = self.signal_comb_idxs['dm'] if 'dm' in self.signal_comb_idxs.keys() else None
         if self.chrom_idxs is not None:
-            self.get_Fmat_concat = self.update_red_basis(chrom_index = jnp.ones(self.data.npsrs) * 2)
+            # build_basis returns the dm block achromatic; give it the DM index.
+            self.get_Fmat_concat = self._scale_chromatic(
+                self.get_Fmat_concat, jnp.ones(self.data.npsrs) * DM_CHROM_INDEX)
+
+        # Extra per-pulsar blocks (chrom / cquad / sw): any signal flagged
+        # `is_extra_block`.  They must be separate (not shared) blocks; their
+        # phi comes from `extra_components` in the phi model, in column order.
+        self.extra_names = sorted(
+            [n for n, s in self.signal_map.items() if getattr(s, 'is_extra_block', False)],
+            key=lambda n: self.signal_comb_idxs[n].start)
+        shared = sutils.parse_basis_string(self.signal_combination_string)['shared_names']
+        bad = [n for n in self.extra_names if n in shared]
+        if bad:
+            raise ValueError(f"{bad} must be separate blocks (after ';'), not shared.")
+        # Blocks whose basis follows the sampled chromatic-GP index.
+        self.chrom_gp_names = [n for n in self.extra_names
+                               if hasattr(self.signal_map[n], 'rescale')]
+        # Their T-matrix columns (static), for partial helper updates.
+        self.chrom_gp_cols = (np.concatenate([sutils._as_positions(self.signal_comb_idxs[n])
+                                              for n in self.chrom_gp_names])
+                              if self.chrom_gp_names else np.zeros(0, dtype=int))
+        self._partial_cores = {}
 
         # Total column count of the assembled T-matrix: timing + every Fourier
         # block + any deterministic block.  NOT 2*nfreqs of a single signal.
@@ -878,22 +917,60 @@ class SuperSignal:
 
         self.model_maker()
         
-    @jit_method     
-    def update_red_basis(self, chrom_index):
-        """        
-        Update the red noise basis using a
-        chromatic index per pulsar. 
+    @jit_method
+    def update_red_basis(self, chrom_index, red_noise_basis=None):
+        """
+        Return the red noise basis with the dm block's chromatic index set
+        per pulsar.
 
         Args:
             chrom_index: The chromatic index per pulsar.
             The shape of the array must be (npsrs)
+            red_noise_basis: The T-matrix to rescale; defaults to
+            ``get_Fmat_concat``.  Its dm block must carry the DM index, as
+            ``get_Fmat_concat``'s does, so pass the basis as built rather
+            than the output of an earlier call.
 
         Returns:
             the updated red noise basis
         """
+        if red_noise_basis is None:
+            red_noise_basis = self.get_Fmat_concat
+        # Relative to the DM index the basis already carries, so no second,
+        # achromatic copy of the dm block has to be stored or traced.
+        return self._scale_chromatic(red_noise_basis, chrom_index - DM_CHROM_INDEX)
+
+    def update_chrom_gp_basis(self, chrom_gp_index, red_noise_basis=None):
+        """Re-index the chromatic-GP blocks (``chrom`` and ``cquad``) per pulsar.
+
+        Both blocks share one index, as in enterprise ``chrom_quad``: the GP
+        columns are rescaled by ``(f_ref/nu)**(index - reference)`` and the
+        quadratic is rebuilt (renormalised, timing projected out if enabled).
+
+        Args:
+            chrom_gp_index: (npsrs,) chromatic index per pulsar.
+            red_noise_basis: T-matrix to update; defaults to
+                ``get_Fmat_concat``.  Its chromatic blocks must still be at the
+                reference index, so pass the basis as built (it may already
+                carry an ``update_red_basis`` DM re-indexing -- the blocks are
+                disjoint).
+        Returns:
+            The updated basis.
+        """
+        if red_noise_basis is None:
+            red_noise_basis = self.get_Fmat_concat
+        for name in self.chrom_gp_names:
+            sl = self.signal_comb_idxs[name]
+            sig = self.signal_map[name]
+            red_noise_basis = red_noise_basis.at[:, sl].set(
+                sig.rescale(red_noise_basis[:, sl], chrom_gp_index))
+        return red_noise_basis
+
+    def _scale_chromatic(self, basis, chrom_index):
+        """Scale each TOA's row of the dm block by ``(f_ref / f_radio)**chrom_index``."""
         index = chrom_index[self.data.dm_exploder_idxs]
         DM = self.data.ref_over_radio_freqs ** index
-        return self.get_Fmat_concat.at[:, self.chrom_idxs].multiply(DM[:, None])
+        return basis.at[:, self.chrom_idxs].multiply(DM[:, None])
 
     def padd_tm_design_matrix(self):
         """        
@@ -1082,6 +1159,81 @@ class SuperSignal:
 
         return get_helpers
 
+    def get_helpers_partial(self, red_noise_basis, base_helpers, cols=None, **kwargs):
+        """TNT / TNr / rNr / logdet_N after a change to only some columns of T.
+
+        Recomputes ``C^T N^-1 [T | r]`` for the changed columns ``C`` and
+        writes it into ``base_helpers``; see
+        ``WhiteCov.get_red_helpers_partial``.  ``base_helpers`` must come from
+        ``get_helpers`` with the SAME white noise and residuals, and every
+        column outside ``cols`` must be unchanged.
+
+        Parameters
+        ----------
+        red_noise_basis : array [n_toas, nmodes]
+            The updated T-matrix (traced).
+        base_helpers : tuple
+            Previous ``(TNT, TNr, rNr, logdet_N)`` (traced).
+        cols : 1-D int array or slice, optional
+            Columns that changed (static).  Defaults to the chromatic-GP
+            columns (``chrom`` and ``cquad``), the ones ``update_chrom_gp_basis``
+            rewrites.
+        **kwargs
+            ``white_noise_params`` / ``reff`` when not bound at construction,
+            as for ``get_helpers``.
+        """
+        cols = self.chrom_gp_cols if cols is None else cols
+        key = tuple(int(c) for c in sutils._as_positions(cols))
+        core = self._partial_cores.get(key)
+        if core is None:
+            bound = dict(N_list=self.data.Nmat, cols=np.asarray(key, dtype=int))
+            if self.fixed_wn:
+                bound['white_noise_params'] = self.data.fixed_white_noise_params
+            if self.fixed_res:
+                bound['reff'] = jnp.concat(self.data.raw_residuals)[:, None]
+            core = jit(partial(self._partial_unjitted, **bound))
+            self._partial_cores[key] = core
+        return core(red_noise_basis=red_noise_basis, base_helpers=base_helpers, **kwargs)
+
+    def get_static_helpers(self, red_noise_basis=None, **kwargs):
+        """Residual-independent helper parts ``(TNT, N^-1 T, logdet_N)``.
+
+        For a sampled nonlinear timing model with FIXED white noise and a
+        fixed basis: compute once, then ``get_helpers_from_static`` each step
+        (cost ~ n_toa * nmodes instead of n_toa * nmodes^2).  Pass
+        ``white_noise_params`` unless they were fixed at construction.
+        """
+        if red_noise_basis is None:
+            red_noise_basis = self.get_Fmat_concat
+        wn = kwargs.get('white_noise_params', self.data.fixed_white_noise_params
+                        if self.fixed_wn else None)
+        if not hasattr(self, '_static_core'):
+            self._static_core = jit(self.data.Nmat.get_static_helpers)
+        return self._static_core(red_noise_basis, wn)
+
+    def get_helpers_from_static(self, static, **kwargs):
+        """(TNT, TNr, rNr, logdet_N) from ``get_static_helpers`` and the
+        current residuals (``reff``, unless fixed at construction)."""
+        if not hasattr(self, '_from_static_core'):
+            bound = dict(N_list=self.data.Nmat)
+            if self.fixed_wn:
+                bound['white_noise_params'] = self.data.fixed_white_noise_params
+            if self.fixed_res:
+                bound['reff'] = jnp.concat(self.data.raw_residuals)
+            self._from_static_core = jit(partial(self._from_static_unjitted, **bound))
+        return self._from_static_core(static=static, **kwargs)
+
+    @staticmethod
+    def _from_static_unjitted(static, N_list, white_noise_params, reff):
+        return N_list.get_red_helpers_from_static(static, reff, white_noise_params)
+
+    @staticmethod
+    def _partial_unjitted(red_noise_basis, base_helpers, N_list, cols,
+                          white_noise_params, reff):
+        return N_list.get_red_helpers_partial(
+            red_noise_basis=red_noise_basis, cols=cols, base_helpers=base_helpers,
+            residuals=reff, white_noise_params=white_noise_params)
+
     def model_maker(self):
         """Build ``self.model``, the phi model for the assembled basis.
 
@@ -1121,6 +1273,10 @@ class SuperSignal:
                 dm_bins               = self.signal_map['dm'].nfreqs,
                 f_dm                  = self.signal_map['dm'].freqs,
             )
+
+        if self.extra_names:
+            model_kwargs['extra_components'] = [
+                self.signal_map[n].extra_component() for n in self.extra_names]
 
         if not self.has_cor:
             model_kwargs.update(dict(
@@ -1325,7 +1481,7 @@ class SuperSignal:
         # unconditionally is what made both reparameterised likelihoods raise
         # KeyError('timing') for any string without 'ltm'.
         P_parts = [self.signal_comb_idxs[k]
-                   for k in ('timing', 'unc', 'dm', 'gtm')
+                   for k in ('timing', 'unc', 'dm', 'gtm', *self.extra_names)
                    if k in self.signal_comb_idxs]
         if not P_parts:
             raise ValueError(
