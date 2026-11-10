@@ -3,9 +3,11 @@
 Builds an ATLAS model and the matching independent reference ingredients from
 the same fixture, so a test body is a one-line comparison.
 
-Imports only ``ATLAS.data``, ``ATLAS.model_builder``, ``ATLAS.nMatrix`` and
-``ATLAS.psd_functions`` -- none of which need ``jug``, ``enterprise``,
-``libstempo`` or ``$TEMPO2``.  ``ATLAS.pulsar`` is deliberately never touched.
+Imports only ``ATLAS.data``, ``ATLAS.model_builder``, ``ATLAS.nMatrix``,
+``ATLAS.psd_functions`` and the CW waveform in
+``ATLAS.signals.deterministic.det_signals`` -- none of which need ``jug``,
+``enterprise``, ``libstempo`` or ``$TEMPO2``.  ``ATLAS.pulsar`` is deliberately
+never touched.
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ from ATLAS.data import PTA_Data
 from ATLAS.model_builder import ModelBuilder
 from ATLAS.nMatrix.base import WhiteCov
 from ATLAS.psd_functions import powerlaw, hd_orf
+from ATLAS.signals.deterministic.det_signals import cw_delay_evolve_float64
 
 # One white-noise point, used everywhere so the reference and ATLAS agree by
 # construction on the parameters rather than by accident.
@@ -42,6 +45,20 @@ DM_REF_FREQ = 1400.0
 
 ZERO_ORF = lambda angle: jnp.zeros_like(jnp.asarray(angle))
 ORFS = {"hd": hd_orf, "zero": ZERO_ORF}
+
+# One continuous-wave source for a `det` block, in the order
+# `cw_delay_evolve_float64` unpacks: log10 chirp mass, log10 f_gw, cos i, psi,
+# log10 h, cos theta, phi, phase0.
+CW_BOUNDS = np.array([[7.2, -8.7, -1.0, 0.0, -18.0, -1.0, 0.0, 0.0],
+                      [9.0, -8.2, 1.0, np.pi, -12.0, 1.0, 2 * np.pi, 2 * np.pi]]).T
+CW_PARAMS = (8.5, -8.4, 0.3, 1.0, -13.5, 0.2, 2.0, 1.0)
+
+
+def cw_point(npsr, cw=CW_PARAMS):
+    """`D_params` for one CW source: (det_params, psr_phases, psr_dists)."""
+    return (jnp.array(cw),
+            jnp.linspace(0.1, 6.0, npsr),
+            jnp.linspace(0.8, 1.5, npsr))
 
 
 @dataclass
@@ -61,6 +78,7 @@ class Model:
     n_gtm: int = 0
     adaptus_basis: object = None
     gtm_psd: object = None
+    n_det: int = 0
 
     @property
     def npsr(self):
@@ -76,7 +94,14 @@ class Model:
 
     @property
     def ncol(self):
+        """Width of the stochastic (non-det) basis: what `z` whitens and what
+        `lnposterior_reparam` returns coefficients for."""
         return self.n_tm + 2 * self.n_irn + 2 * self.n_dm + self.n_gtm
+
+    def det_params(self, cw=CW_PARAMS):
+        """`D_params` for a `det` block, or None without one -- which the
+        likelihoods accept either way."""
+        return cw_point(self.npsr, cw) if self.n_det else None
 
     def red_params(self, irn=(-15.0, 3.5), gwb=(-14.8, 13 / 3), dm=(-15.5, 2.5),
                    irn_overrides=None):
@@ -124,13 +149,13 @@ def white_noise_vector(psrs, include_ecorr=True):
 @lru_cache(maxsize=32)
 def build(npsr=2, model_string="ltm|unc+cor->unc", linear_timing=True,
           marg_timing=False, orf_name="hd", n_gwb=4, n_irn=6, include_ecorr=True,
-          fixture="synth", n_dm=0, n_gtm=0):
+          fixture="synth", n_dm=0, n_gtm=0, n_det=0):
     psrs = load_psrs(fixture, npsr)
     npsr = len(psrs)
     adaptus_basis, gtm_psd = (make_adaptus_basis(psrs, n_gtm) if n_gtm else (None, None))
     data = PTA_Data(
         psrs, num_gwb_bins=n_gwb, num_irn_bins=n_irn,
-        num_dm_bins=(n_dm or None),
+        num_dm_bins=(n_dm or None), num_det_bins=(n_det or None),
         adaptus_basis=adaptus_basis, adaptus_size=(n_gtm or None),
         fixed_white_noise_params=None,
         linear_timing=linear_timing, marg_timing=marg_timing,
@@ -143,6 +168,8 @@ def build(npsr=2, model_string="ltm|unc+cor->unc", linear_timing=True,
         irn_psd_function=powerlaw, gwb_psd_function=powerlaw,
         orf_function=ORFS[orf_name],
         dm_psd_function=(powerlaw if n_dm else None),
+        det_delay_function=(cw_delay_evolve_float64 if n_det else None),
+        det_parameter_bounds=(CW_BOUNDS if n_det else None),
         gt_psd_val=(jnp.asarray(gtm_psd) if n_gtm else None),
         irn_lower_bound_psd=jnp.array([-20.0, 0.0]),
         irn_upper_bound_psd=jnp.array([-11.0, 7.0]),
@@ -158,7 +185,7 @@ def build(npsr=2, model_string="ltm|unc+cor->unc", linear_timing=True,
                              white_noise_params=wn_vec)
     return Model(psrs, data, wn, rn, helpers, wn_vec, residuals,
                  n_gwb, n_irn, orf_name, include_ecorr,
-                 n_dm, n_gtm, adaptus_basis, gtm_psd)
+                 n_dm, n_gtm, adaptus_basis, gtm_psd, n_det)
 
 
 # --------------------------------------------------------------------------- #
@@ -306,6 +333,9 @@ def dense_bundle(model, include_ecorr=None):
 # `"ltm|unc+cor->unc;gtm"` is the production string in
 # notebooks/easiest_way_to_use_atlas.py, so it is the one that matters most.
 #
+# A `det` case needs `D_params` (`Model.det_params()`) in every likelihood call,
+# and its `z` is `Model.ncol` wide: the deterministic columns are not whitened.
+#
 CORPUS = {
     "curn": dict(model_string="unc+cor->unc", linear_timing=False),
     "curn-margtm": dict(model_string="unc+cor->unc", linear_timing=False,
@@ -315,4 +345,180 @@ CORPUS = {
     "ltm-gtm": dict(model_string="ltm|unc+cor->unc;gtm", linear_timing=True, n_gtm=8),
     "ltm-dm-gtm": dict(model_string="ltm|unc+cor->unc;dm,gtm", linear_timing=True,
                        n_dm=3, n_gtm=8),
+    "curn-margtm-det": dict(model_string="unc+cor->unc;det", linear_timing=False,
+                            marg_timing=True, n_det=6),
+    "ltm-det": dict(model_string="ltm|unc+cor->unc;det", linear_timing=True, n_det=6),
 }
+
+
+# --------------------------------------------------------------------------- #
+#  NG20 v2.0 vanilla noise: chrom, cquad, sw
+# --------------------------------------------------------------------------- #
+#
+# `build_ng20` mirrors `build` for the chromatic and solar-wind blocks.  The
+# reference side (`ng20_dense`) assembles T and phi per pulsar from
+# `reference`, in the column order `SuperSignal.build_basis` produces:
+# [timing | unc (cor nested at its head) | separate blocks in string order].
+# Zero padding columns ATLAS adds (cquad's 4th column, sw up to the widest
+# pulsar) are left out of the reference: a zero column of T changes nothing
+# in C = N + T phi T^T.
+
+NG20_CHROM_BINS = 7
+NG20_SW_DT_DAYS = 60.0
+NG20_DMCONST = 1.0 / 2.41e-4        # PINT's DMconst, s MHz^2 cm^3 / pc
+NG20_MATERN = dict(kernel="MATERN", log10_ell=2.0, nu=1.5)
+
+NG20_CORPUS = {
+    "curn-all":   dict(model_string="unc+cor->unc;dm,chrom,cquad,sw"),
+    "irn-all":    dict(model_string="unc;dm,chrom,cquad,sw"),
+    "ltm-all":    dict(model_string="ltm|unc+cor->unc;dm,chrom,cquad,sw"),
+    "curn-chrom": dict(model_string="unc+cor->unc;dm,chrom"),
+    "curn-sw":    dict(model_string="unc+cor->unc;dm,sw"),
+    "curn-matern": dict(model_string="unc+cor->unc;dm,chrom,cquad,sw", sw_kernel="MATERN"),
+}
+
+
+def sw_geometry_synth(psr):
+    """A smooth, positive, annually modulated stand-in for the solar-wind
+    geometry [pc].  The real one comes from PINT; the algebra does not care."""
+    t = np.asarray(psr.toas, dtype=np.float64)
+    return 1e-5 * (1.5 + np.cos(2 * np.pi * t / 3.15581e7 + 0.3 * t.size))
+
+
+@dataclass
+class NG20Model:
+    psrs: list
+    data: object
+    rn: object
+    helpers: tuple
+    wn_vec: jnp.ndarray
+    residuals: np.ndarray
+    blocks: tuple            # ordered stochastic blocks after unc, e.g. ('dm', 'chrom', ...)
+    has_cor: bool
+    n_tm: int
+    chrom_index: float
+    cquad_project: bool
+    sw_kernel: str
+    n_irn: int
+    n_gwb: int
+    n_dm: int
+    n_chrom: int
+
+    @property
+    def npsr(self):
+        return len(self.psrs)
+
+    def theta(self, seed=0):
+        """One draw of every sampled hyperparameter, as a dict of lists."""
+        rng = np.random.default_rng(seed)
+        n = self.npsr
+        return dict(
+            irn=[(rng.uniform(-15.5, -14.0), rng.uniform(2, 5)) for _ in range(n)],
+            dm=[(rng.uniform(-15.5, -14.0), rng.uniform(1, 4)) for _ in range(n)],
+            chrom=[(rng.uniform(-16.0, -14.0), rng.uniform(1, 4)) for _ in range(n)],
+            sw=[rng.uniform(-0.5, 0.8) for _ in range(n)],
+            gwb=(rng.uniform(-15.5, -14.5), 13 / 3))
+
+    def red_params(self, theta):
+        """``theta`` -> the flat vector, by name, so this cannot drift from
+        ``get_param_names``."""
+        vals = {}
+        for i, psr in enumerate(self.data.psr_names):
+            psr = str(psr)
+            vals[f"{psr}_irn_log10_A"], vals[f"{psr}_irn_gamma"] = theta["irn"][i]
+            vals[f"{psr}_dm_log10_A"], vals[f"{psr}_dm_gamma"] = theta["dm"][i]
+            vals[f"{psr}_chrom_log10_A"], vals[f"{psr}_chrom_gamma"] = theta["chrom"][i]
+            vals[f"{psr}_sw_log10_amp"] = theta["sw"][i]
+        vals["gwb_log10_A"], vals["gwb_gamma"] = theta["gwb"]
+        return jnp.array([vals[k] for k in self.rn.model.get_param_names()])
+
+
+@lru_cache(maxsize=16)
+def build_ng20(model_string="unc+cor->unc;dm,chrom,cquad,sw", npsr=2,
+               n_irn=6, n_gwb=4, n_dm=5, n_chrom=NG20_CHROM_BINS,
+               chrom_index=4.0, cquad_project=True, sw_kernel="RIDGE"):
+    from ATLAS.signals.signals_utils import parse_basis_string
+    psrs = load_psrs("synth", npsr)
+    linear_timing = model_string.startswith("ltm|")
+    data = PTA_Data(
+        psrs, num_gwb_bins=n_gwb, num_irn_bins=n_irn, num_dm_bins=n_dm,
+        num_det_bins=None, adaptus_basis=None, adaptus_size=None,
+        fixed_white_noise_params=None, linear_timing=linear_timing,
+        marg_timing=False, diag_white_cov=False, fixed_res=False,
+        timfiles=None, parfiles=None, noise_dict=None, dm_ref_freq=DM_REF_FREQ)
+    WhiteCov(data=data, stabilize_TNT=False, include_ecorr=True)
+    lo, hi = jnp.array([-20.0, 0.0]), jnp.array([-11.0, 7.0])
+    sw_kwargs = dict(dt_days=NG20_SW_DT_DAYS)
+    if sw_kernel != "RIDGE":
+        sw_kwargs.update(NG20_MATERN)
+    rn = ModelBuilder(data=data).make_red_noise(
+        model_string,
+        irn_psd_function=powerlaw, gwb_psd_function=powerlaw, orf_function=ZERO_ORF,
+        dm_psd_function=powerlaw, chrom_psd_function=powerlaw,
+        irn_lower_bound_psd=lo, irn_upper_bound_psd=hi,
+        gwb_lower_bound_psd=lo, gwb_upper_bound_psd=hi,
+        dm_lower_bound_psd=lo, dm_upper_bound_psd=hi,
+        chrom_lower_bound_psd=lo, chrom_upper_bound_psd=hi,
+        num_chrom_bins=n_chrom, chrom_index=chrom_index,
+        cquad_project_timing=cquad_project,
+        sw_geometry=[sw_geometry_synth(p) for p in psrs], sw_kwargs=sw_kwargs)
+    wn_vec = white_noise_vector(psrs, True)
+    helpers = rn.get_helpers(reff=jnp.concat(data.raw_residuals), white_noise_params=wn_vec)
+    cfg = parse_basis_string(model_string)
+    return NG20Model(psrs, data, rn, helpers, wn_vec,
+                     np.concatenate([np.asarray(p.residuals) for p in psrs]),
+                     tuple(n for n in cfg["separate_names"] if n != "unc"),
+                     "cor" in cfg["shared_names"],
+                     rn.linear_timing_model_size, chrom_index, cquad_project,
+                     sw_kernel, n_irn, n_gwb, n_dm, n_chrom)
+
+
+def ng20_dense(model, theta, chi=None):
+    """Per-pulsar reference ``T_p`` and the global ``phi`` for ``theta``.
+
+    ``chi`` (per pulsar) is the chromatic index of chrom and cquad; defaults
+    to the index the model was built with.
+    """
+    chi = [model.chrom_index] * model.npsr if chi is None else list(chi)
+    tspan = float(model.data.pta_tspan)
+    df = 1.0 / tspan
+    f = lambda n: np.arange(1, n + 1) / tspan
+    T_blocks, phis = [], []
+    for i, p in enumerate(model.psrs):
+        t, nu = np.asarray(p.toas, float), np.asarray(p.freqs, float)
+        cols, ph = [], []
+        if model.n_tm:
+            Ms = svd_basis(p.Mmat)
+            Mp = np.zeros((t.size, model.n_tm)); Mp[:, :Ms.shape[1]] = Ms
+            cols.append(Mp)
+            ph.append(np.where(np.arange(model.n_tm) < Ms.shape[1], 1e40, 1.0))
+        irn = ref.powerlaw_psd(f(model.n_irn), df, *theta["irn"][i])
+        if model.has_cor:
+            irn[:model.n_gwb] += ref.powerlaw_psd(f(model.n_gwb), df, *theta["gwb"])
+        cols.append(ref.fourier_basis(t, f(model.n_irn))); ph.append(np.repeat(irn, 2))
+        for blk in model.blocks:
+            if blk == "dm":
+                cols.append(ref.fourier_basis(t, f(model.n_dm))
+                            * ref.chromatic_weight(nu, 2.0, DM_REF_FREQ)[:, None])
+                ph.append(np.repeat(ref.powerlaw_psd(f(model.n_dm), df, *theta["dm"][i]), 2))
+            elif blk == "chrom":
+                cols.append(ref.fourier_basis(t, f(model.n_chrom))
+                            * ref.chromatic_weight(nu, chi[i], DM_REF_FREQ)[:, None])
+                ph.append(np.repeat(ref.powerlaw_psd(f(model.n_chrom), df, *theta["chrom"][i]), 2))
+            elif blk == "cquad":
+                U = svd_basis(p.Mmat) if model.cquad_project else None
+                cols.append(ref.chrom_quad_basis(t, nu, chi[i], U, DM_REF_FREQ))
+                ph.append(np.ones(3))                        # cquad_log10_amp = 0
+            elif blk == "sw":
+                L, nodes = ref.interp_basis(t, dt_days=NG20_SW_DT_DAYS)
+                cols.append(L * (sw_geometry_synth(p) * NG20_DMCONST / nu ** 2)[:, None])
+                if model.sw_kernel == "RIDGE":
+                    ph.append(ref.sw_kernel(nodes, "RIDGE", theta["sw"][i]))
+                else:
+                    kw = {k: v for k, v in NG20_MATERN.items() if k != "kernel"}
+                    ph.append(ref.sw_kernel(nodes, "MATERN", theta["sw"][i], **kw))
+            else:
+                raise ValueError(f"no reference for block {blk!r}")
+        T_blocks.append(np.hstack(cols))
+        phis.append(block_diag(*[np.diag(x) if x.ndim == 1 else x for x in ph]))
+    return T_blocks, block_diag(*phis)

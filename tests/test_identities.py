@@ -369,6 +369,73 @@ def test_separate_cor_block():
     m.rn.lnposterior_reparam(m.helpers, m.red_params(), z)
 
 
+@pytest.mark.parametrize("layout", [
+    pytest.param(dict(model_string="ltm|unc+cor->unc", linear_timing=True), id="nested"),
+    pytest.param(dict(model_string="ltm|unc;cor", linear_timing=True), id="separate"),
+    pytest.param(dict(model_string="unc;cor", linear_timing=False), id="separate-no-ltm"),
+])
+def test_partial_marg_gwb_block_matches_reference(layout):
+    '''
+
+    The dense GWB block that `partial_marg` keeps (`partial_reparm_helper`)
+    equals the independent reference: per bin, phi_G = S_k * Gamma with the HD
+    ORF, inverted and repeated over the sin/cos quadratures, and
+    logdet = 2 * sum_k log|S_k Gamma|. Regression: the off-diagonal ORF terms
+    were scattered with absolute bin indices, which point past the end of the
+    GWB-only array when 'cor' is a separate basis block, so they were silently
+    dropped and `partial_marg` became CURN.
+
+    Arguments
+    ------------------------------
+    layout : dict
+    	`harness.build` keyword arguments for the model-string layout.
+
+    Returns
+    ------------------------------
+    None
+
+    '''
+    npsr = 3
+    m = H.build(npsr=npsr, orf_name="hd", **layout)
+    red = m.red_params()
+    phiinv_G, logdet_G, _, _ = m.rn.model.partial_reparm_helper(red, m.rn._pad_mask)
+
+    # reference GWB covariance per bin: S_k * Gamma (Gamma has a unit diagonal)
+    _, _, gwb = H.psd_pieces(m, red)
+    gamma = H.orf_matrix(m)
+    phi_G = gwb[:, None, None] * gamma[None]
+    expected_inv = np.repeat(np.linalg.inv(phi_G), 2, axis=0)
+    expected_logdet = 2 * np.sum(np.linalg.slogdet(phi_G)[1])
+
+    assert np.allclose(np.asarray(phiinv_G), expected_inv, rtol=TIGHT, atol=0)
+    assert abs(float(logdet_G) - expected_logdet) / abs(expected_logdet) < TIGHT
+
+
+def test_partial_marg_separate_block_uses_the_orf():
+    '''
+
+    End to end, `partial_marg_lnposterior` on a separate 'cor' block must
+    depend on the ORF: the HD and zero-ORF models give different densities at
+    the same point. Before the local-index fix they were identical, because
+    the HD cross terms were dropped.
+
+    Arguments
+    ------------------------------
+    None
+
+    Returns
+    ------------------------------
+    None
+
+    '''
+    z = jnp.asarray(np.random.default_rng(0).normal(size=(3, 2 * 4)))
+    values = {}
+    for orf_name in ("hd", "zero"):
+        m = H.build(npsr=3, model_string="ltm|unc;cor", orf_name=orf_name)
+        values[orf_name] = float(m.rn.partial_marg_lnposterior(m.helpers, m.red_params(), z)[0])
+    assert abs(values["hd"] - values["zero"]) > 1e-6 * abs(values["zero"])
+
+
 def test_dm_model_string_builds_and_evaluates():
     """B1 regression: a model string containing `dm` used to be unreachable,
     because PTA_Data stored `self.dm_bins` while make_red_noise read
@@ -410,7 +477,8 @@ def test_reparam_density_matches_dense_conditional_corpus(case):
 
     This is the test that covers `;gtm` -- the production model string, and the
     one whose `has_gtm_direct` branch switches the whole phi pipeline from bin
-    to mode resolution.
+    to mode resolution.  The reference has no deterministic term, so a `det`
+    case is compared on the residuals with its waveform subtracted.
     """
     kw = dict(H.CORPUS[case])
     if kw.get("marg_timing"):
@@ -418,12 +486,15 @@ def test_reparam_density_matches_dense_conditional_corpus(case):
                     "test_marg_timing_solve_matches_dense")
     m = H.build(orf_name="hd", **kw)
     red = m.red_params(irn_overrides={1: (-14.7, 4.0)})
+    D = m.det_params()
     T, _, Nfull, r = H.dense_bundle(m)
+    if D is not None:
+        r = r - np.asarray(m.rn.det_signal.get_det_residuals(*D))
     phi = H.global_phi(m, red)
     rng = np.random.default_rng(31)
     deltas = []
-    for z in rng.normal(size=(4, m.npsr, m.rn.nmodes)):
-        lp, coeff = m.rn.lnposterior_reparam(m.helpers, red, jnp.asarray(z))
+    for z in rng.normal(size=(4, m.npsr, m.ncol)):
+        lp, coeff = m.rn.lnposterior_reparam(m.helpers, red, jnp.asarray(z), D_params=D)
         deltas.append(float(lp) - ref.conditional_logL(
             r, T, np.asarray(coeff).ravel(), phi, Nfull))
     deltas = np.array(deltas)
@@ -436,24 +507,68 @@ def test_partial_marg_agrees_with_reparam_corpus(case):
     # dense reference and works on the marg_timing path too.
     m = H.build(orf_name="zero", **H.CORPUS[case])
     red = m.red_params(irn_overrides={1: (-14.7, 4.0)})
+    D = m.det_params()
     rng = np.random.default_rng(32)
-    zr = rng.normal(size=(m.npsr, m.rn.nmodes))
+    zr = rng.normal(size=(m.npsr, m.ncol))
     zp = rng.normal(size=(m.npsr, 2 * m.n_gwb))
-    v_r = float(m.rn.lnposterior_reparam(m.helpers, red, jnp.asarray(zr))[0]) \
+    v_r = float(m.rn.lnposterior_reparam(m.helpers, red, jnp.asarray(zr), D_params=D)[0]) \
         + 0.5 * np.sum(zr ** 2)
-    v_p = float(m.rn.partial_marg_lnposterior(m.helpers, red, jnp.asarray(zp))[0]) \
+    v_p = float(m.rn.partial_marg_lnposterior(m.helpers, red, jnp.asarray(zp), D_params=D)[0]) \
         + 0.5 * np.sum(zp ** 2)
     assert abs(v_r - v_p) / abs(v_r) < LOOSE
 
 
 @pytest.mark.parametrize("case", CORPUS)
 def test_corpus_gradients_are_finite(case):
-    """Cheap smoke over the corpus: a NaN gradient anywhere is a dead sampler."""
+    """Cheap smoke over the corpus: a NaN gradient anywhere is a dead sampler.
+    For a `det` case that includes the CW parameters, which NUTS samples too."""
     m = H.build(orf_name="hd", **H.CORPUS[case])
     red = m.red_params()
-    z = jnp.zeros((m.npsr, m.rn.nmodes))
-    g = jax.grad(lambda q: m.rn.lnposterior_reparam(m.helpers, q, z)[0])(red)
+    D = m.det_params()
+    z = jnp.zeros((m.npsr, m.ncol))
+    g = jax.grad(lambda q: m.rn.lnposterior_reparam(m.helpers, q, z, D_params=D)[0])(red)
     assert np.all(np.isfinite(np.asarray(g)))
+    if D is not None:
+        gd = jax.grad(lambda c: m.rn.lnposterior_reparam(
+            m.helpers, red, z, D_params=(c, *D[1:]))[0])(D[0])
+        assert np.all(np.isfinite(np.asarray(gd))) and np.any(np.asarray(gd) != 0.0)
+
+
+DET_CORPUS = [pytest.param(k, id=k) for k, kw in H.CORPUS.items() if kw.get("n_det")]
+
+
+@pytest.mark.parametrize("orf_name", ["zero", "hd"])
+@pytest.mark.parametrize("case", DET_CORPUS)
+def test_det_block_equals_subtracting_the_waveform(case, orf_name):
+    """A `det` block is exactly the stochastic model on the residuals with the
+    same waveform subtracted by hand:
+
+        lnpost(r, D_params)  ==  lnpost_without_det(r - F_det a_det)
+
+    for both likelihoods, which pins the sign and placement of every
+    deterministic cross term.  It covers the marg_timing path, which the dense
+    reference cannot.  Measured agreement is <= 3.4e-16.
+    """
+    kw = dict(H.CORPUS[case])
+    m = H.build(orf_name=orf_name, **kw)
+    kw.pop("n_det")
+    m0 = H.build(orf_name=orf_name, **dict(kw, model_string=kw["model_string"].replace(";det", "")))
+    assert m0.rn.nmodes == m.ncol
+    D = m.det_params()
+    r = jnp.concat(m.data.raw_residuals) - m.rn.det_signal.get_det_residuals(*D)
+    h0 = m0.rn.get_helpers(reff=r, white_noise_params=m0.wn_vec)
+
+    red = m.red_params(irn_overrides={1: (-14.7, 4.0)})
+    rng = np.random.default_rng(33)
+    zr = jnp.asarray(rng.normal(size=(m.npsr, m.ncol)))
+    zp = jnp.asarray(rng.normal(size=(m.npsr, 2 * m.n_gwb)))
+    reparam = lambda mm, h, **k: mm.rn.lnposterior_reparam(h, red, zr, **k)
+    pmarg = lambda mm, h, **k: mm.rn.partial_marg_lnposterior(h, red, zp, **k)
+    for lnpost in (reparam, pmarg):
+        v, c = lnpost(m, m.helpers, D_params=D)
+        v0, c0 = lnpost(m0, h0)
+        assert abs(float(v) - float(v0)) < TIGHT * abs(float(v0))
+        assert np.max(np.abs(np.asarray(c) - np.asarray(c0))) < TIGHT * np.max(np.abs(np.asarray(c0)))
 
 
 # --------------------------------------------------------------------------- #
