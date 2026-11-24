@@ -1,0 +1,81 @@
+# Hierarchical astrophysical inference of the GWB, Pandora-style, as an atlas-run config.
+#
+# An HD free-spectrum background whose halflog10_rho get a trained flow
+# p(log10_rho | theta) as prior, with the astrophysical parameters theta sampled
+# (and the per-pulsar intrinsic red noise), under a holodeck parameter-space prior
+# on theta. This is the YAML form of ng20astromethods' run_pandora config.json:
+#
+#   run_pandora config.json            this file
+#   ---------------------------------  ----------------------------------------------
+#   flow.dir / flow.file               model.signals.astro.flow / .pickle
+#   data.path, data.noise_dict         data.pickle (source: enterprise_pickle), data.noise_dict
+#   pta.tspan_policy, pta.tspan_rtol   model.signals.astro.tspan_policy, .tspan_rtol
+#   pta.int_bins (null = flow bins)    frequency_bins.num_irn_bins (>= the flow's bins)
+#   pta.inc_ecorr                      white_noise.include_ecorr
+#   pta.irn_gamma_*, irn_log10A_*      priors_astro.yaml: irn_pandora
+#   priors.astro_bounds                priors_astro.yaml: astro_gwb.<theta name>
+#   priors.rho_bounds                  priors_astro.yaml: astro_gwb.halflog10_rho
+#   fixed_astro_params                 model.signals.astro.fixed
+#   (pspace prior, always on)          model.signals.astro.log_prior: pspace
+#   sampler (PTMCMC)                   sampler (NUTS)
+#   post.n_prior_draws                 model.signals.astro.n_prior_draws
+#   gwb_log10_rho.npy, summary.json    the same files in the run directory (gwb_log10_rho,
+#     gwb_log10_rho / p_rho_zero         p_rho_zero); no plots
+#
+# Offset-mode flows (zero_handling 'offset') are sampled, as in run_pandora, in
+# y = log10(rho + c) from the bottom of their zero slab; the GWB parameters are then
+# astro_log10_rho_plus_c_i, and only the upper halflog10_rho edges are used.
+#
+# The flow fixes the GWB frequencies: the runner sets the PTA's Tspan to the
+# flow's for every Fourier basis. ng20 flows need torch (e.g. atlas-env-2);
+# FlaxAstroFlow.from_zuko(flow).save(dir) converts one for torch-free runs.
+config_version: 1
+
+vars:
+  flow_dir: /path/to/train_flow_output       # zuko_flow.pkl + transform_data.npz
+  data_dir: /path/to/NG20
+
+output:
+  root: ./astro_runs
+
+data:
+  source: enterprise_pickle
+  pickle: ${data_dir}/psrs.pkl
+  noise_dict: ${data_dir}/wn_dict.json
+  cache_dir: ./atlas_cache
+
+timing:
+  linear_timing: false
+  marg_timing: true                          # run_pandora marginalizes the timing model
+
+white_noise:
+  vary: false
+  include_ecorr: true
+
+frequency_bins:
+  num_irn_bins: 5                            # = the flow's GWB bins, as run_pandora's int_bins: null
+
+model:
+  basis_string: "unc+astro->unc"
+  priors_file: priors_astro.yaml
+  signals:
+    unc: {psd: powerlaw, priors: irn_pandora}
+    astro:
+      flow: ${flow_dir}
+      priors: astro_gwb
+      fixed: {}                              # e.g. {mmb_zplaw_amp: 0.0}
+      log_prior: pspace                      # the flow's recorded holodeck parameter space
+      tspan_policy: strict                   # run_pandora's default
+      tspan_rtol: 1.0e-3
+      n_prior_draws: 20000                   # run_pandora's post.n_prior_draws
+
+sampler:
+  marg_over_non_gwb: true
+  num_warmup: 1000
+  num_samples: 4000
+  num_chains: 1
+  seed: 170817
+  nuts: {target_accept_prob: 0.8, max_tree_depth: 10}
+
+runs:
+  - name: astro_pandora_style

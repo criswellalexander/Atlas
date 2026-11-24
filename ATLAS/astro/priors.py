@@ -25,32 +25,36 @@ __all__ = ["get_param_space", "pspace_log_prior"]
 PANDORA_PHENOM = "PS_Pandora_Phenom"
 
 
-def get_param_space(name):
+def get_param_space(name, nsamples=None, seed=None):
     '''
 
-    Build a holodeck parameter space by name, without drawing samples.
+    Build a holodeck parameter space by name.
 
     Arguments
     ------------------------------
     name : str
     	A key of ``holodeck.librarian.param_spaces_dict``, or
     	'PS_Pandora_Phenom' for ``ATLAS.astro.flows.trainset.pandora_phenom_param_space``.
+    nsamples : int or None
+    	Number of prior draws (``param_samples``); None draws none. (Default: None)
+    seed : int or None
+    	Seed of the draws. (Default: None)
 
     Returns
     ------------------------------
     pspace : holodeck.librarian.lib_tools._Param_Space
-    	The parameter space, built with ``nsamples=None``.
+    	The parameter space.
 
     '''
     if name == PANDORA_PHENOM:
         from ATLAS.astro.flows.trainset import pandora_phenom_param_space
-        return pandora_phenom_param_space(nsamples=None)
+        return pandora_phenom_param_space(nsamples=nsamples, seed=seed)
     import holodeck.librarian
     spaces = holodeck.librarian.param_spaces_dict
     if name not in spaces:
         raise KeyError(f"unknown parameter space {name!r}; available: "
                        f"{sorted(spaces) + [PANDORA_PHENOM]}")
-    return spaces[name](nsamples=None)
+    return spaces[name](nsamples=nsamples, seed=seed)
 
 
 def pspace_log_prior(pspace, context_names, n_grid=2001):
@@ -71,6 +75,8 @@ def pspace_log_prior(pspace, context_names, n_grid=2001):
     y_lo(x)). Inside a sampler's box that is wider than the support, NUTS sees
     these edges as rejected (divergent) trajectories; they do not bias the
     posterior.
+
+    Every context parameter must be a parameter of the space.
 
     Fixed parameters need no special handling: evaluating the joint density
     at the fixed values gives the conditional density of the varied ones up
@@ -98,6 +104,11 @@ def pspace_log_prior(pspace, context_names, n_grid=2001):
     if isinstance(pspace, str):
         pspace = get_param_space(pspace)
     context_names = list(context_names)
+    # every context parameter needs a prior; a name the space lacks would silently get none
+    unknown = [nn for nn in context_names if nn not in list(pspace.param_names)]
+    if unknown:
+        raise ValueError(f"context parameters {unknown} are not in the parameter space "
+                         f"{pspace.name} ({list(pspace.param_names)})")
 
     terms = []                                  # (kind, context columns, constants)
     for pdist in pspace._parameters:

@@ -456,10 +456,10 @@ class FlaxAstroFlow:
     n_params : int
         Number of astrophysical parameters.
     metadata : dict, optional
-        ``param_names``, ``f_conv``, ``tspan``, ... With
-        ``zero_handling='offset'`` and ``rho_offset`` (ng20astromethods
-        flows), the flow models ``y = log10(rho + rho_offset)`` and is
-        evaluated and sampled in ``log10_rho`` here.
+        ``param_names``, ``f_conv``, ``tspan``, ... An offset-mode flow
+        (``zero_handling='offset'``, ng20astromethods) models
+        ``y = log10(rho + rho_offset)``; it is evaluated and sampled in that
+        variable, which ``AstroGWB`` samples directly.
 
     ``log_prob`` and ``sample`` are plain JAX: they work under ``jax.jit``,
     ``jax.grad`` and ``jax.vmap``, and inside numpyro models.
@@ -479,10 +479,6 @@ class FlaxAstroFlow:
         self.half_range_ast, self.half_range_gwb = half[:p], half[p:]
         self.n_freqs = int(mean.shape[0]) - p
         self.metadata = dict(metadata or {})
-        # Offset-mode flows model y = log10(rho + c); ng20 files store rho_offset
-        # whatever the mode, so the mode decides
-        self.rho_offset = (float(self.metadata["rho_offset"])
-                           if self.metadata.get("zero_handling") == "offset" else None)
 
     @property
     def mapping(self):
@@ -492,20 +488,13 @@ class FlaxAstroFlow:
     # ---- physical <-> normalized -------------------------------------------------
 
     def transform_rho_to_scaled_interval(self, gwb_rho):
-        if self.rho_offset is not None:
-            gwb_rho = jnp.log10(10.0**gwb_rho + self.rho_offset)
         return self.B * (gwb_rho - self.mean_gwb) / self.half_range_gwb
 
     def transform_params_to_scaled_interval(self, ast_params):
         return self.B * (ast_params - self.mean_ast) / self.half_range_ast
 
     def transform_rho_to_physical_interval(self, gwb_rho):
-        out = gwb_rho * self.half_range_gwb / self.B + self.mean_gwb
-        if self.rho_offset is not None:
-            # back from y = log10(rho + c); NaN where rho = 10^y - c <= 0
-            out = jnp.log10(10.0**out - self.rho_offset)
-            out = jnp.where(jnp.isfinite(out), out, jnp.nan)
-        return out
+        return gwb_rho * self.half_range_gwb / self.B + self.mean_gwb
 
     def transform_params_to_physical_interval(self, ast_params):
         return ast_params * self.half_range_ast / self.B + self.mean_ast
@@ -514,25 +503,6 @@ class FlaxAstroFlow:
         """``log |d(scaled)/d(physical)|`` of the modelled variable."""
         half = self.half_range_ast if self.nf_type == "theta|rho" else self.half_range_gwb
         return jnp.sum(jnp.log(self.B / half))
-
-    def log10_rho_training_range(self, lower_fallback=-12.0):
-        """
-        Physical ``(lo, hi)`` of ``log10_rho`` over the training set, as numpy arrays.
-
-        For an offset-mode flow the range is mapped back from
-        ``log10(rho + c)``; where it reaches ``rho <= 0`` the lower edge is
-        ``lower_fallback`` (run_pandora's ``rho_lower_fallback``).
-        """
-        lo = np.asarray(self.mean_gwb - self.half_range_gwb)
-        hi = np.asarray(self.mean_gwb + self.half_range_gwb)
-        if self.rho_offset is not None:
-            with np.errstate(invalid="ignore", divide="ignore"):
-                lo = np.log10(10.0**lo - self.rho_offset)
-                hi = np.log10(10.0**hi - self.rho_offset)
-            lo = np.where(np.isfinite(lo), lo, lower_fallback)
-            if not np.all(np.isfinite(hi)):
-                raise ValueError("the flow's training range has rho <= 0 at its upper edge")
-        return lo, hi
 
     # ---- density and samples ------------------------------------------------------
 
@@ -546,11 +516,6 @@ class FlaxAstroFlow:
             shape = jnp.broadcast_shapes(x.shape[:-1], c.shape[:-1])
             lp = model.log_prob(jnp.broadcast_to(x, shape + x.shape[-1:]),
                                 jnp.broadcast_to(c, shape + c.shape[-1:]))
-        if self.rho_offset is not None and self.nf_type != "theta|rho":
-            # dy/dlog10_rho = rho / (rho + c) for y = log10(rho + c). Not constant,
-            # so it is part of the density even with jacobian=False (as in run_pandora)
-            rho = 10.0 ** jnp.asarray(log10_rho, jnp.float64)
-            lp = lp + jnp.sum(jnp.log(rho / (rho + self.rho_offset)), axis=-1)
         return lp + self.log_jacobian() if jacobian else lp
 
     def log_prob(self, log10_rho, astro_params=None, jacobian=True):
@@ -558,9 +523,7 @@ class FlaxAstroFlow:
         Log density of the modelled variable (a JAX array).
 
         ``jacobian=True`` gives the density in physical units; ``False`` the
-        density in the normalized space (Pandora's convention). It controls
-        only the constant affine term: an offset-mode flow always includes
-        the (non-constant) Jacobian of ``log10(rho + c)``.
+        density in the normalized space (Pandora's convention).
         """
         return self._log_prob(self.model, log10_rho, astro_params, jacobian)
 

@@ -138,6 +138,8 @@ def test_errors():
     with pytest.raises(NotImplementedError, match="PD_Uniform_Log"):
         pspace_log_prior("PS_Astro_Strong_Hard_All",
                          get_param_space("PS_Astro_Strong_Hard_All").param_names)
+    with pytest.raises(ValueError, match="not in the parameter space"):
+        pspace_log_prior(ps, ["theta_0", "theta_1"])   # e.g. a Pandora flow without names
     with pytest.raises(KeyError, match="unknown parameter space"):
         get_param_space("PS_Not_A_Space")
     assert get_param_space(PHENOM).name == PHENOM
@@ -151,12 +153,16 @@ def _run_pandora():
         pytest.skip("set ATLAS_RUN_PANDORA_DIR to the directory holding run_pandora.py")
     spec = importlib.util.spec_from_file_location("run_pandora", os.path.join(where, "run_pandora.py"))
     module = importlib.util.module_from_spec(spec)
+    # run_pandora imports its sibling pta_matrices.py (validate_flow it locates itself)
+    sys.path.insert(0, where)
     try:
         spec.loader.exec_module(module)
     except ImportError as exc:
         pytest.skip(f"run_pandora does not import here: {exc}")
     finally:
-        sys.modules.pop("validate_flow", None)
+        sys.path.remove(where)
+        for name in ("validate_flow", "pta_matrices", "train_flow"):
+            sys.modules.pop(name, None)
     return module
 
 
@@ -174,3 +180,20 @@ def test_matches_run_pandora(fixed):
     got = np.asarray(pspace_log_prior(ps, names)(theta))
     assert np.all(np.isfinite(ref))
     assert np.allclose(got, ref, rtol=1e-13, atol=1e-12)
+
+
+def test_offset_psd_matches_run_pandora():
+    """The zero-slab PSD of an offset-mode astro block is run_pandora's offset_free_spectrum,
+    except that slab bins carry RHO_FLOOR**2 instead of 0 (see astro_gwb.RHO_FLOOR)."""
+    rp = _run_pandora()
+    pytest.importorskip("flax")
+    from ATLAS.signals.correlated.astro_gwb import RHO_FLOOR, _offset_free_spectrum
+
+    c = 1e-9
+    y = np.linspace(np.log10(c) - 0.5, np.log10(c) + 2.0, 41)
+    ours = np.asarray(_offset_free_spectrum(c)(None, None, *y))[:, 0]
+    theirs = np.asarray(rp.offset_free_spectrum(c)(None, None, *y))[:, 0]
+    slab = theirs == 0
+    assert slab.any() and (~slab).any()
+    assert np.array_equal(ours[~slab], theirs[~slab])
+    assert np.all(ours[slab] == RHO_FLOOR**2)

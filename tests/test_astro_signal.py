@@ -28,7 +28,8 @@ from ATLAS.psd_functions import gwb_free_spectrum, hd_orf, powerlaw  # noqa: E40
 from ATLAS.samplers.canetoadracing import MultiHMCGibbs  # noqa: E402
 from ATLAS.signals import signals_utils as sutils  # noqa: E402
 from ATLAS.astro.flows.flax import FlaxAstroFlow  # noqa: E402
-from ATLAS.signals.correlated.astro_gwb import AstroGWB, set_flow_tspan  # noqa: E402
+from ATLAS.signals.correlated.astro_gwb import (  # noqa: E402
+    RHO_FLOOR, AstroGWB, _offset_free_spectrum, set_flow_tspan)
 
 from . import harness as H  # noqa: E402
 from .test_flax_flows import F, P, _flow  # noqa: E402
@@ -124,7 +125,9 @@ def build(data, psrs, model_string, flow, common="astro", **astro_kw):
     '''
 
     Build the astro model, or the reference model with a `cor` block in its
-    place (free spectrum, HD, the flow's training range as the rho box).
+    place: HD, with the astro model's spectral variable and box (log10 rho
+    over the training range, or for an offset-mode flow y = log10(rho + c)
+    from the bottom of the zero slab, with run_pandora's offset PSD).
 
     Arguments
     ------------------------------
@@ -151,14 +154,20 @@ def build(data, psrs, model_string, flow, common="astro", **astro_kw):
     	The white-noise vector the helpers were built with.
 
     '''
-    lo, hi = (jnp.asarray(a) for a in flow.log10_rho_training_range())
-    kw = dict(irn_psd_function=powerlaw, irn_lower_bound_psd=IRN_LO, irn_upper_bound_psd=IRN_HI,
-              gwb_lower_bound_psd=lo, gwb_upper_bound_psd=hi)
+    offset = flow.metadata.get("zero_handling") == "offset"
+    lo, hi = flow.mean_gwb - flow.half_range_gwb, flow.mean_gwb + flow.half_range_gwb
+    if offset:
+        c = flow.metadata["rho_offset"]
+        lo = jnp.full(F, np.log10(c) - flow.metadata["slab_dex"])
+    kw = dict(irn_psd_function=powerlaw, irn_lower_bound_psd=IRN_LO, irn_upper_bound_psd=IRN_HI)
     if common == "astro":
         kw.update(astro_flow=flow, **astro_kw)
+        if not offset:         # the training range is the default box; offset boxes come from the slab
+            kw.update(gwb_lower_bound_psd=lo, gwb_upper_bound_psd=hi)
     else:
         model_string = model_string.replace("astro", "cor")
-        kw.update(gwb_psd_function=gwb_free_spectrum, orf_function=hd_orf)
+        kw.update(gwb_psd_function=_offset_free_spectrum(c) if offset else gwb_free_spectrum,
+                  orf_function=hd_orf, gwb_lower_bound_psd=lo, gwb_upper_bound_psd=hi)
     rn = ModelBuilder(data=data).make_red_noise(model_string, **kw)
     wn_vec = H.white_noise_vector(psrs, True)
     helpers = rn.get_helpers(reff=jnp.concat(data.raw_residuals), white_noise_params=wn_vec)
@@ -333,12 +342,13 @@ def extra_log_prior(theta):
     return -0.5 * jnp.sum(((theta - 0.1) / 0.7) ** 2)
 
 
-def assert_hyperprior_identity(data, psrs, flow, model_string, marg, vary_white, **astro_kw):
+def assert_hyperprior_identity(data, psrs, flow, model_string, marg, vary_white, rho=None,
+                               **astro_kw):
     '''
 
     log p_astro - log p_cor = log p_flow(rho | theta) + astro_log_prior(theta)
     - sum log(theta box widths), at the same site values; the cor model has
-    a free-spectrum HD block with the flow's training range as its box.
+    an HD block over the same spectral variable and box (see `build`).
 
     Arguments
     ------------------------------
@@ -354,6 +364,9 @@ def assert_hyperprior_identity(data, psrs, flow, model_string, marg, vary_white,
     	marg_over_non_gwb branch.
     vary_white : bool
     	Sample the white noise (helpers rebuilt in the model).
+    rho : array_like or None
+    	Values of the spectral variable to check at; None draws them inside
+    	the box. (Default: None)
     astro_kw : dict
     	Astro keywords of `make_red_noise` (astro_log_prior, fixed_astro, ...).
 
@@ -369,6 +382,8 @@ def assert_hyperprior_identity(data, psrs, flow, model_string, marg, vary_white,
 
     params = point(rn_a, flow, marg)
     params["astro_params"] = params["astro_params"][sig.varied]
+    if rho is not None:
+        params["red_noise"] = params["red_noise"].at[rn_a.common_param_slice].set(jnp.asarray(rho))
     if vary_white:
         params["white_noise"] = wn_vec
     got = float(log_density(model_maker, (), maker_kwargs(rn_a, helpers_a, wn_vec, marg, vary_white),
@@ -458,19 +473,33 @@ def test_pspace_prior_and_named_fixed_parameter(setup, marg):
     assert list(sig.varied) == [1] and sig.astro_param_names == ["mmb_scatter_dex"]
 
 
+C_OFF, SLAB = 10.0 ** -8.5, 0.30103
+
+
+def offset_flow(flow, **meta):
+    """The flow as an ng20 offset-mode flow (y = log10(rho + c)) with a zero slab."""
+    return with_metadata(flow, **dict(dict(zero_handling="offset", rho_offset=C_OFF,
+                                           slab_dex=SLAB), **meta))
+
+
 @pytest.mark.parametrize("model_string", ["ltm|unc+astro->unc", "ltm|unc;astro"],
                          ids=["nested", "separate"])
-def test_offset_flow_in_the_model(setup, model_string):
+@pytest.mark.parametrize("marg", [False, True], ids=["reparam", "partial-marg"])
+def test_zero_slab_flow_in_the_model(setup, marg, model_string):
     '''
 
-    An offset-mode flow (y = log10(rho + c)) keeps the exact identity, and
-    its default rho box is the training range mapped back to log10 rho, with
-    the lower edge at the fallback where the range reaches rho <= 0.
+    An offset-mode flow is sampled in y = log10(rho + c), as in run_pandora:
+    the box runs from the bottom of the zero slab to the training range's top,
+    the PSD is max(10^y - c, 0)^2 (no power in the slab), the parameters are
+    astro_log10_rho_plus_c_i, and the flow is evaluated at y. The identity
+    holds with one bin in the slab and one above it.
 
     Arguments
     ------------------------------
     setup : tuple
     	Module fixture (data, pulsars, flow).
+    marg : bool
+    	marg_over_non_gwb branch.
     model_string : str
     	Nested or separate common-process layout.
 
@@ -480,15 +509,41 @@ def test_offset_flow_in_the_model(setup, model_string):
 
     '''
     data, psrs, flow = setup
-    # c at the middle of the first bin's training range, so that bin's range reaches rho <= 0
-    c = float(10.0 ** (flow.mean_gwb[0] - 0.5 * flow.half_range_gwb[0]))
-    offset = with_metadata(flow, zero_handling="offset", rho_offset=c)
-    lo, hi = offset.log10_rho_training_range()
-    assert lo[0] == -12.0 and np.all(np.isfinite(lo)) and np.all(lo < hi)
-    rn, _, _ = build(data, psrs, model_string, offset)
-    assert np.array_equal(np.asarray(rn.model.lower_prior_lim_all)[rn.common_param_slice], lo)
-    assert_hyperprior_identity(data, psrs, offset, model_string, True, False,
+    off = offset_flow(flow)
+    rn, _, _ = build(data, psrs, model_string, off)
+    sig = rn.astro_signal
+    lo = np.asarray(rn.model.lower_prior_lim_all)[rn.common_param_slice]
+    hi = np.asarray(rn.model.upper_prior_lim_all)[rn.common_param_slice]
+    assert np.array_equal(lo, np.full(F, np.log10(C_OFF) - SLAB))
+    assert np.array_equal(hi, np.asarray(flow.mean_gwb + flow.half_range_gwb))
+    assert rn.model.get_param_names()[rn.common_param_slice] == \
+        [f"astro_log10_rho_plus_c_{i}" for i in range(F)]
+
+    y = np.array([np.log10(C_OFF) - 0.1, np.log10(C_OFF) + 0.5, np.log10(C_OFF) + 1.0])
+    rho2 = np.clip(10.0**y - C_OFF, RHO_FLOOR, None) ** 2      # the slab bin: rho = 0 (floored)
+    assert np.array_equal(np.asarray(sig.psd_function(None, None, *y))[:, 0], rho2)
+    assert rho2[0] == RHO_FLOOR**2
+    assert np.array_equal(np.asarray(sig.get_phi_diag(jnp.asarray(y))), np.repeat(rho2, 2))
+    assert_hyperprior_identity(data, psrs, off, model_string, marg, False, rho=y,
                                astro_log_prior=extra_log_prior)
+
+
+def test_zero_slab_bounds_and_errors(setup):
+    data, psrs, flow = setup
+    with pytest.raises(ValueError, match="without a zero slab"):
+        AstroGWB(data, offset_flow(flow, slab_dex=0.0))
+    with pytest.raises(ValueError, match="without a zero slab"):     # saved before the slab
+        AstroGWB(data, with_metadata(flow, zero_handling="offset", rho_offset=C_OFF))
+    with pytest.warns(UserWarning, match="lower bounds are ignored"):
+        sig = AstroGWB(data, offset_flow(flow), lower_bound_psd=np.full(F, -9.0))
+    assert np.array_equal(sig.parameter_range[:, 0], np.full(F, np.log10(C_OFF) - SLAB))
+    # bounds are on log10 rho: the upper edges map to y = log10(10^hi + c)
+    sig = AstroGWB(data, offset_flow(flow), upper_bound_psd=np.full(F, -7.0))
+    assert np.allclose(sig.parameter_range[:, 1], np.log10(1e-7 + C_OFF), rtol=1e-15)
+    # drop-mode flows keep halflog10_rho names and the training-range box
+    rn, _, _ = build(data, psrs, "ltm|unc+astro->unc", with_metadata(flow, zero_handling="drop",
+                                                                     rho_offset=C_OFF))
+    assert rn.model.get_param_names()[rn.common_param_slice][0] == "astro_halflog10_rho_0"
 
 
 def test_all_theta_fixed_has_no_site(setup):
@@ -714,3 +769,54 @@ def test_gpu_matches_cpu(setup):
                 num_warmup=10, num_samples=10, progress_bar=False)
     mcmc.run(jax.random.PRNGKey(0), **kw)
     assert np.all(np.isfinite(np.asarray(mcmc.get_samples()["astro_params"])))
+
+
+# ---- spectrum outputs (run_pandora's postprocess) ---------------------------------------------
+
+def test_spectrum_outputs(setup):
+    '''
+
+    `gwb_log10_rho` maps an offset flow's y to log10 rho with NaN for rho = 0;
+    `spectrum_summary` gives run_pandora's p_rho_zero and per-bin intervals;
+    `flow_prior_log10_rho` draws theta from the parameter space with the fixed
+    values inserted and keeps those inside the box.
+
+    Arguments
+    ------------------------------
+    setup : tuple
+    	Module fixture (data, pulsars, flow).
+
+    Returns
+    ------------------------------
+    None
+
+    '''
+    pytest.importorskip("holodeck")
+    from ATLAS.astro.priors import get_param_space
+    from ATLAS.astro.utils import flow_prior_log10_rho, gwb_log10_rho, spectrum_summary
+
+    _, _, flow = setup
+    off = offset_flow(flow)
+    y = np.array([[np.log10(C_OFF) - 0.1, -8.0, -7.0], [-8.2, np.log10(C_OFF) - 0.2, -6.5]])
+    post = gwb_log10_rho(y, off)
+    assert np.isnan(post[0, 0]) and np.isnan(post[1, 1])
+    assert np.allclose(post[0, 1:], np.log10(10.0**y[0, 1:] - C_OFF), rtol=1e-15)
+    assert np.array_equal(gwb_log10_rho(y, flow), y)                    # drop mode: unchanged
+
+    summ = spectrum_summary(post)
+    assert summ["p_rho_zero"] == dict(posterior=[0.5, 0.5, 0.0])
+    b0 = summ["gwb_log10_rho"]["log10_rho_0"]
+    assert b0["median"] == post[1, 0] and b0["p_rho_zero"] == 0.5        # rho > 0 samples only
+
+    names = ["gsmf_phi0_log10", "mmb_scatter_dex"]
+    named = with_metadata(off, param_names=names)
+    container, varied = np.array([-2.5, 0.0]), np.array([1])
+    lo, hi = np.array([0.2]), np.array([0.45])
+    got = flow_prior_log10_rho(named, "PS_Pandora_Phenom", names, container, varied, lo, hi, 300, 4)
+    ps = get_param_space("PS_Pandora_Phenom", nsamples=300, seed=4)
+    theta = ps.param_samples[:, [list(ps.param_names).index(n) for n in names]]
+    theta[:, 0] = -2.5
+    keep = (theta[:, 1] > 0.2) & (theta[:, 1] < 0.45)
+    want = gwb_log10_rho(np.asarray(named.sample(jax.random.key(4), (), jnp.asarray(theta[keep]))), named)
+    assert 0 < keep.sum() < 300 and got.shape == (keep.sum(), F)
+    assert np.array_equal(np.isnan(got), np.isnan(want)) and np.allclose(got, want, equal_nan=True)

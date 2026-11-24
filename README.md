@@ -313,8 +313,13 @@ mcmc.run(..., super_sig=rn, marg_over_non_gwb=True)
   `ZukoAstroFlow.save`, an ng20astromethods directory (`zuko_flow.pkl` +
   `transform_data.npz`, whose metadata it keeps), or a Pandora pickle and
   mapping (`pickle=..., mapping=...`). All but flax need torch; pickles run
-  code when loaded, so only load trusted files. Flows trained with
-  `zero_handling='offset'` (on log10(rho + c)) are evaluated in log10 rho.
+  code when loaded, so only load trusted files.
+- Flows trained with `zero_handling='offset'` (on y = log10(rho + c), ng20astromethods)
+  are sampled in y, as `run_pandora` does: the box starts at the bottom of the zero slab
+  (log10 c − `slab_dex`), a bin in the slab has rho = 0 (no GWB power), so the flow's slab
+  mass is P(rho = 0 | theta), and the parameters are `astro_log10_rho_plus_c_i`. Only the
+  upper `gwb_upper_bound_psd` (log10 rho, mapped to y) applies; `slab_dex` = 0 raises.
+  `ATLAS.astro.utils.gwb_log10_rho` maps samples back to log10 rho (NaN where rho = 0).
 - The number of background bins is the flow's. `set_flow_tspan` sets
   `data.pta_tspan` to the flow's training span, which every Fourier basis
   uses, so call it before building the model. It warns if the flow's span is
@@ -330,7 +335,13 @@ mcmc.run(..., super_sig=rn, marg_over_non_gwb=True)
   `param_space`.
 - `model_maker` adds the site `astro_params` and the factor `astro_hyperprior`;
   with `MultiHMCGibbs`, put `astro_params` in one of the groups.
-- The rho parameters are named `astro_halflog10_rho_i`.
+- The rho parameters are named `astro_halflog10_rho_i` (`astro_log10_rho_plus_c_i` for
+  offset-mode flows).
+- `atlas-run` configs take the same model through `model.signals.astro` (see
+  `ATLAS/runner/templates/run_config.yaml`); `ATLAS/runner/examples/astro/` is the
+  YAML form of a Pandora-style (`run_pandora`) analysis. Astro runs also write
+  `gwb_log10_rho.npy` and the `p_rho_zero` / `gwb_log10_rho` blocks of `summary.json`, as
+  `run_pandora` does.
 
 ## Timing model
 

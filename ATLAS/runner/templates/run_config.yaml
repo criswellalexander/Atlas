@@ -67,6 +67,12 @@ timing:
                              # | from_pulsar  (PulsarDataLoader.sample_params)
                              # | {file: info.npz, key: SAMPLE_LIST, index: 0}  -> {psr: [...]}
     parametrization: klam    # klam | simple (bounded per-parameter priors)
+  design_matrix:             # which RAW design-matrix columns the linear timing /
+                             # timing marginalisation uses (restricted before the SVD)
+    columns: all             # all | sampled | not_sampled | [F0, F1] | {psr: [...]}
+                             #   not_sampled + nonlinear: sample some params, marginalise the rest
+                             #   sampled (nonlinear off): STANDARD run on DIRECT's parameters
+    keep_offset: true
 
 white_noise:
   vary: false                # false = fixed at data.noise_dict
@@ -99,6 +105,24 @@ model:
       fixed: {gamma: 4.333333333333333}
       orf: hd_orf            # hd_orf | zero_orf | monopole_orf | dipole_orf | param_hd_orf | ...
       priors: gwb_powerlaw
+    astro:                   # used with 'astro' in basis_string, in place of 'cor', e.g.
+                             #   "unc+astro->unc ; dm": HD free spectrum whose halflog10_rho
+                             #   get a trained p(log10_rho | theta) flow as prior, theta sampled
+      flow: null             # flow directory: Atlas (FlaxAstroFlow/ZukoAstroFlow.save) or
+                             #   ng20astromethods (zuko_flow.pkl + transform_data.npz); offset-mode
+                             #   flows sample y = log10(rho + c) from the bottom of their zero slab
+      pickle: null           # Pandora NFMaker pickle (with mapping), or another ng20 pickle name
+      mapping: null          # Pandora *_mapping_data.npy.npz; pickles run code: trusted files only
+      priors: null           # key in the priors file (astro_gwb below); null = training ranges
+      fixed: {}              # {theta name: value}, e.g. {mmb_zplaw_amp: 0.0}
+      log_prior: null        # null | pspace (holodeck parameter-space prior) | file.py:function
+                             #   (JAX function of the full theta, flow order)
+      pspace: null           # parameter-space name; null = the flow's recorded param_space
+      tspan_policy: flow     # the bases use the flow's Tspan: flow (warn if shorter than the
+                             #   data's, error if longer) | strict (error unless equal)
+      tspan_rtol: 1.0e-3
+      n_prior_draws: 20000   # theta draws from the param space for the flow-prior spectrum and
+                             #   P(rho = 0) in summary.json (needs a param space); 0 skips it
     dm:
       psd: powerlaw
       priors: dm_powerlaw
@@ -135,7 +159,7 @@ sampler:
   kind: nuts
   model: atlas               # atlas | path/to/file.py:function  (custom: function(run, built)
                              #   returns (numpyro_model, kwargs for mcmc.run))
-  marg_over_non_gwb: false   # true: keep only the GWB coefficients (needs `cor`)
+  marg_over_non_gwb: false   # true: keep only the GWB coefficients (needs `cor` or `astro`)
   nuts: {target_accept_prob: 0.8, max_tree_depth: 10, dense_mass: false}
   num_warmup: 500
   num_samples: 4000
@@ -144,6 +168,9 @@ sampler:
   thinning: 1
   seed: 170817               # run i uses seed + i unless it overrides sampler.seed
   seed_offset_var: null      # or a variable name: seed + vars[name] (e.g. realization)
+  beta: null                 # thermodynamic integration: power on the partially marginalised
+                             #   likelihood (needs marg_over_non_gwb, a 'cor' block,
+                             #   stabilize_TNT false); sweep it and run atlas-evidence
   progress_bar: false
 
 runs:

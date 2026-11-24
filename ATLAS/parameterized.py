@@ -1337,6 +1337,7 @@ class CorrelatedPulsarRedNoise(_GTMModeMixin, _ExtraBlocksMixin):
         # ---- naming of the common process ----
         common_name='cor',
         gwb_param_prefix='gwb',
+        gwb_param_label=None,
     ):
         """
         Parameters
@@ -1376,6 +1377,11 @@ class CorrelatedPulsarRedNoise(_GTMModeMixin, _ExtraBlocksMixin):
         gwb_param_prefix : str, default 'gwb'
             Prefix of the common-process parameter names in
             ``get_param_names``.
+        gwb_param_label : str, optional
+            Name of the sampled GWB variable in ``get_param_names`` when it is
+            not the PSD's own (e.g. ``'log10_rho_plus_c'`` for an offset-mode
+            astro flow, giving ``astro_log10_rho_plus_c_i``).  None uses the
+            PSD signature's names.
 
         Raises
         ------
@@ -1405,6 +1411,7 @@ class CorrelatedPulsarRedNoise(_GTMModeMixin, _ExtraBlocksMixin):
 
         self.common_name   = common_name
         self.gwb_param_prefix = gwb_param_prefix
+        self.gwb_param_label = gwb_param_label
         self.GWB_slice     = _fourier_slice(common_name)
         self.GWB_fidxs     = jnp.arange(self.GWB_slice.start, self.GWB_slice.stop)
         # `_eye` is built with crn_bins rows and is cho_solve'd against
@@ -2376,6 +2383,9 @@ class CorrelatedPulsarRedNoise(_GTMModeMixin, _ExtraBlocksMixin):
         gwb_names = _psd_signature_names(self.gwb_psd_func, self.crn_bins)[
             np.asarray(self.gwb_varied_indxs)
         ]
+        if self.gwb_param_label is not None:
+            # free-spectrum names are '<sentinel>_<i>': keep the bin index, swap the label
+            gwb_names = [f"{self.gwb_param_label}_{p.rsplit('_', 1)[1]}" for p in gwb_names]
         names += [f"{self.gwb_param_prefix}_{p}" for p in gwb_names]
 
         if not self.orf_fixed:

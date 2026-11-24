@@ -85,6 +85,7 @@ def _model_and_args(run, b):
     ``mcmc.run`` so ``jit_model_args=True`` traces them (the T-matrix in
     particular, which would otherwise be folded into the executable)."""
     from ATLAS.model import model_maker
+    import jax.numpy as jnp
 
     sig, smp = run["model"]["signals"], run["sampler"]
     vary_white = bool(run["white_noise"]["vary"])
@@ -100,6 +101,13 @@ def _model_and_args(run, b):
                  chrom_gp_index_bounds=tuple(float(x) for x in sig["chrom"]["index_bounds"]),
                  tm_direct_sampling_type=run["timing"]["nonlinear"]["parametrization"])
     args = dict(raw_residuals=b.residuals)
+    if smp["beta"] is not None:
+        # traced, so a beta sweep reuses one compiled model per shape
+        args["beta"] = jnp.asarray(float(smp["beta"]))
+    if smp["switch_overrides"]:
+        bound["switch_super_sig"] = _switch_model(run).rn
+    if sig["cor"].get("prior_flow"):
+        bound["gwb_prior_flow"] = _gwb_prior_flow(run, b)
     basis_moves = chrom_idx or dm_idx or vary_white or b.tm_model is not None
     if vary_white:
         args.update(wn_lower_bound=b.wn_lower, wn_upper_bound=b.wn_upper)
@@ -122,20 +130,67 @@ def _model_and_args(run, b):
     return partial(model_maker, **bound), args
 
 
+def _gwb_prior_flow(run, b):
+    """FlowPrior for the GWB spectrum parameters (model.signals.cor.prior_flow)."""
+    from ATLAS.experimental.flow_prior import FlowPrior, gwb_param_slice
+    from ATLAS.runner.config import _resolve
+    spec = dict(run["model"]["signals"]["cor"]["prior_flow"])
+    path = _resolve(run, spec.pop("file"))
+    g0, g1 = gwb_param_slice(b.rn.model)
+    lo = np.asarray(b.rn.model.lower_prior_lim_all)[g0:g1]
+    hi = np.asarray(b.rn.model.upper_prior_lim_all)[g0:g1]
+    prior = FlowPrior.load(path, lo, hi, **spec)
+    log.info("GWB prior from flow %s: %r", path, prior)
+    return prior
+
+
+def _switch_model(run):
+    """Model A of a model-switch TI run: this run with sampler.switch_overrides."""
+    import copy
+    from ATLAS.runner.config import set_dotted, validate_run
+    from ATLAS.runner.build import build_model
+    ra = copy.deepcopy(run)
+    for path, value in run["sampler"]["switch_overrides"].items():
+        set_dotted(ra, path, value)
+    ra["sampler"]["switch_overrides"] = None
+    parsed, resolved = validate_run(ra, check_files=False)
+    return build_model(ra, parsed, resolved)
+
+
+_BOUNDED_TIMING = {"ECC", "M2", "PX"}       # sampled directly (see sample_timing_theta)
+
+
+def timing_mass_blocks(run, b):
+    """One dense-mass block per pulsar with its sampled timing sites.
+
+    parametrization 'simple': p{i}_cosi_SINI, p{i}_ECC / _M2 / _PX, and
+    p{i}_z_<name> for every other parameter; 'klam': [timing_k, timing_lam].
+    """
+    if b.tm_model is None:
+        return []
+    if run["timing"]["nonlinear"]["parametrization"] == "klam":
+        return [("timing_k", "timing_lam")]
+    blocks = []
+    for i, params in enumerate(b.tm_model.sample_list):
+        sites = []
+        for k in params:
+            if k == "SINI":
+                sites.append(f"p{i}_cosi_SINI")
+            elif k in _BOUNDED_TIMING:
+                sites.append(f"p{i}_{k}")
+            else:
+                sites.append(f"p{i}_z_{k}")
+        if sites:
+            blocks.append(tuple(sites))
+    return blocks
+
+
 def _custom_model(run, b):
     """``sampler.model: path/to/file.py:function`` -> ``function(run, built)``,
     which returns ``(model, kwargs)`` for ``MCMC.run``.  The run's variables
     are in ``run['vars']``."""
-    import importlib.util
-    from ATLAS.runner.config import resolve_path
-    f, fn = run["sampler"]["model"].rsplit(":", 1)
-    path = resolve_path(run, f)
-    spec = importlib.util.spec_from_file_location(f"atlas_custom_{abs(hash(path))}", path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    if not hasattr(mod, fn):
-        raise AttributeError(f"{path} has no function {fn!r}")
-    model, args = getattr(mod, fn)(run, b)
+    from ATLAS.runner.config import load_function
+    model, args = load_function(run, run["sampler"]["model"])(run, b)
     return model, dict(args or {})
 
 
@@ -146,7 +201,36 @@ def _named(samples, b):
     for site in ("chrom_gp_index", "chromatic_index"):
         if site in samples:
             names[site] = [f"{n}_{site}" for n in b.psr_names]
+    if getattr(b.rn, "has_astro", False):
+        names["astro_params"] = list(b.rn.astro_signal.astro_param_names)
     return names
+
+
+def _astro_spectrum(run, b, samples, out_dir):
+    """run_pandora's GWB spectrum outputs for an astro run.
+
+    Writes ``gwb_log10_rho.npy`` ((chains x draws, F) log10 rho, NaN where
+    rho = 0) and returns the ``p_rho_zero`` / ``gwb_log10_rho`` summary blocks,
+    with the flow prior's when a parameter space is known and
+    ``model.signals.astro.n_prior_draws`` > 0.
+    """
+    from ATLAS.astro.utils import flow_prior_log10_rho, gwb_log10_rho, spectrum_summary
+    sig, a = b.rn.astro_signal, run["model"]["signals"]["astro"]
+    red = np.asarray(samples["red_noise"])
+    post = gwb_log10_rho(red[..., b.rn.common_param_slice].reshape(-1, sig.flow.n_freqs), sig.flow)
+    np.save(out_dir / "gwb_log10_rho.npy", post)
+
+    prior = None
+    pspace = a["pspace"] or sig.flow.metadata.get("param_space")
+    if a["n_prior_draws"] and pspace is not None:
+        try:
+            prior = flow_prior_log10_rho(sig.flow, pspace, sig.context_names, sig.astro_container,
+                                         sig.varied, np.asarray(sig.astro_lower),
+                                         np.asarray(sig.astro_upper), a["n_prior_draws"],
+                                         int(run["sampler"]["seed"]))
+        except ImportError as exc:
+            log.warning("flow-prior spectrum skipped: %s", exc)
+    return spectrum_summary(post, prior)
 
 
 def _save(run, samples, names, diverging):
@@ -185,9 +269,15 @@ def _netcdf_engine():
     return eng
 
 
-def _summary(samples, names, diverging):
-    from numpyro.diagnostics import summary
+def _summary(samples, names, diverging, beta=None):
+    from numpyro.diagnostics import summary, effective_sample_size
     out = {"num_divergent": int(np.sum(diverging)), "parameters": {}}
+    site = "delta_switch" if "delta_switch" in samples else "lnL_partial"
+    if beta is not None and site in samples:
+        x = np.asarray(samples[site], float)                   # (chains, draws)
+        ess = float(effective_sample_size(x)) if x.shape[1] > 3 else float(x.size)
+        out["ti"] = dict(beta=float(beta), mean=float(x.mean()), std=float(x.std(ddof=1)),
+                         n=int(x.size), n_eff=ess, integrand=site)
     for site, nm in names.items():
         if site not in samples:
             continue
@@ -230,7 +320,32 @@ def run_one(run, prebuilt=None):
         smp = run["sampler"]
         custom = smp["model"] != "atlas"
         model, args = _custom_model(run, b) if custom else _model_and_args(run, b)
-        mcmc = MCMC(NUTS(model, **smp["nuts"]),
+        nuts_kw = dict(smp["nuts"])
+        dm = nuts_kw.get("dense_mass")
+        if isinstance(dm, list):
+            # block form: [[red_noise], [white_noise, timing_k]] -> numpyro wants tuples
+            nuts_kw["dense_mass"] = [tuple([g] if isinstance(g, str) else g) for g in dm]
+        if smp["dense_timing_mass"] and not custom:
+            if nuts_kw.get("dense_mass") is True:
+                log.info("dense_mass: true already covers the timing parameters")
+            else:
+                tblocks = timing_mass_blocks(run, b)
+                have = list(nuts_kw.get("dense_mass") or [])
+                taken = {s for blk in have for s in blk}
+                nuts_kw["dense_mass"] = have + [t for t in tblocks if not set(t) & taken]
+                log.info("dense mass blocks: %s", nuts_kw["dense_mass"])
+        if smp["init_white_noise"] == "noise_dict" and not custom:
+            # start the white noise at the noise-dictionary values (clipped into
+            # the prior box), everything else at the usual random init
+            import jax.numpy as jnp
+            from numpyro.infer import init_to_value
+            lo, hi = np.asarray(b.wn_lower), np.asarray(b.wn_upper)
+            v = np.asarray(b.wn_vec, float)
+            span = hi - lo
+            v = np.clip(v, lo + 1e-3 * span, hi - 1e-3 * span)
+            nuts_kw["init_strategy"] = init_to_value(values={"white_noise": jnp.asarray(v)})
+            log.info("white noise initialised from the noise dictionary")
+        mcmc = MCMC(NUTS(model, **nuts_kw),
                     num_warmup=int(smp["num_warmup"]), num_samples=int(smp["num_samples"]),
                     num_chains=int(smp["num_chains"]), thinning=int(smp["thinning"]),
                     chain_method=smp["chain_method"], progress_bar=bool(smp["progress_bar"]),
@@ -248,7 +363,9 @@ def run_one(run, prebuilt=None):
         diverging = np.asarray(mcmc.get_extra_fields(group_by_chain=True)["diverging"])
         names = _named(samples, b)
         path = _save(run, samples, names, diverging) if run["output"]["save"]["samples"] else None
-        summ = _summary(samples, names, diverging)
+        summ = _summary(samples, names, diverging, beta=smp["beta"])
+        if getattr(b.rn, "has_astro", False) and "red_noise" in samples:
+            summ.update(_astro_spectrum(run, b, samples, out_dir))
         (out_dir / "summary.json").write_text(json.dumps(summ, indent=2))
         st = dict(state="done", output=str(path) if path else None,
                   num_divergent=summ["num_divergent"],

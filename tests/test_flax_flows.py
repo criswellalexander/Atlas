@@ -172,67 +172,23 @@ def _with_meta(flow, **meta):
                             metadata=dict(flow.metadata, **meta))
 
 
-@pytest.mark.parametrize("nf_type", ff.NF_TYPES)
-def test_offset_flow_log_prob(nf_type):
-    """The flow models y = log10(rho + c): density of y at y(rho), times |dy/dlog10_rho| when
-    rho is the modelled variable (whatever `jacobian` says); only mapped when it is the context."""
-    flow = _flow(nf_type=nf_type)
-    off = _with_meta(flow, zero_handling="offset", rho_offset=C_OFF)
+def test_offset_metadata_leaves_the_flow_alone(tmp_path):
+    """Offset-mode flows are evaluated and sampled in their own variable y = log10(rho + c),
+    as ng20astromethods' run_pandora does: the zero-handling metadata changes nothing in the
+    flow (AstroGWB samples y), and it survives saving and loading."""
+    flow = _flow()
+    off = _with_meta(flow, zero_handling="offset", rho_offset=C_OFF, slab_dex=0.30103,
+                     slab_shape="truncnorm")
     rho, theta = _points(flow)
-    y = jnp.log10(10.0**rho + C_OFF)
-    th = None if nf_type == "rho" else theta
-    for jac in (True, False):
-        want = flow.log_prob(y, th, jacobian=jac)
-        if nf_type != "theta|rho":
-            want = want + jnp.sum(jnp.log(10.0**rho / (10.0**rho + C_OFF)), axis=-1)
-        assert np.allclose(off.log_prob(rho, th, jacobian=jac), want, rtol=1e-13, atol=1e-12)
-
-
-def test_offset_flow_sample():
-    flow = _flow()
-    off = _with_meta(flow, zero_handling="offset", rho_offset=C_OFF)
-    _, theta = _points(flow)
-    key = jax.random.key(0)
-    y = np.asarray(flow.sample(key, (4000,), theta[0]))
-    x = np.asarray(off.sample(key, (4000,), theta[0]))
-    valid = 10.0**y > C_OFF
-    assert valid.any() and not valid.all()
-    assert np.array_equal(np.isnan(x), ~valid)
-    assert np.allclose(10.0**x[valid] + C_OFF, 10.0**y[valid], rtol=1e-12, atol=0)
-
-
-def test_offset_training_range_and_persistence(tmp_path):
-    flow = _flow()
-    y_lo = np.asarray(flow.mean_gwb - flow.half_range_gwb)
-    y_hi = np.asarray(flow.mean_gwb + flow.half_range_gwb)
-    lo, hi = flow.log10_rho_training_range()
-    assert np.array_equal(lo, y_lo) and np.array_equal(hi, y_hi)
-
-    c = 10.0 ** (y_lo[0] + 0.1)                 # the first bin's range reaches rho <= 0
-    off = _with_meta(flow, zero_handling="offset", rho_offset=c)
-    lo, hi = off.log10_rho_training_range(lower_fallback=-13.0)
-    with np.errstate(invalid="ignore"):
-        want_lo = np.log10(10.0**y_lo - c)
-    want_lo = np.where(np.isfinite(want_lo), want_lo, -13.0)
-    assert lo[0] == -13.0 and np.allclose(lo, want_lo, rtol=1e-14)
-    assert np.allclose(hi, np.log10(10.0**y_hi - c), rtol=1e-14)
-
+    assert np.array_equal(off.log_prob(rho, theta), flow.log_prob(rho, theta))
+    key = jax.random.key(2)
+    assert np.array_equal(off.sample(key, (5,), theta[0]), flow.sample(key, (5,), theta[0]))
     off.save(str(tmp_path))
     again = load_astro_flow(str(tmp_path))
-    assert isinstance(again, ff.FlaxAstroFlow) and again.rho_offset == c
-    rho, theta = _points(flow)
+    assert isinstance(again, ff.FlaxAstroFlow)
+    assert {k: again.metadata[k] for k in ("zero_handling", "rho_offset", "slab_dex")} == \
+        dict(zero_handling="offset", rho_offset=C_OFF, slab_dex=0.30103)
     assert np.array_equal(again.log_prob(rho, theta), off.log_prob(rho, theta))
-
-
-def test_drop_flow_ignores_rho_offset():
-    """ng20 files store rho_offset whatever the zero handling; 'drop' flows are unchanged."""
-    flow = _flow()
-    drop = _with_meta(flow, zero_handling="drop", rho_offset=1e-9)
-    assert drop.rho_offset is None
-    rho, theta = _points(flow)
-    assert np.array_equal(drop.log_prob(rho, theta), flow.log_prob(rho, theta))
-    key = jax.random.key(2)
-    assert np.array_equal(drop.sample(key, (5,), theta[0]), flow.sample(key, (5,), theta[0]))
 
 
 def test_load_astro_flow_errors(tmp_path, monkeypatch):
@@ -472,28 +428,24 @@ def test_from_zuko_astro_flow(nf_type):
     assert flow.metadata["param_names"] == ["a", "b"]
 
 
-def test_offset_zuko_flow_matches_flax():
+def test_offset_metadata_leaves_the_zuko_flow_alone():
     torch, zf = _zuko()
     torch.manual_seed(1)
     nsf = zf.make_zuko_flow(F, P, hidden_features=[16, 16])
     plain = zf.ZukoAstroFlow(nsf, "rho|theta", _mapping(1), P)
     off = zf.ZukoAstroFlow(nsf, "rho|theta", _mapping(1), P,
-                           metadata=dict(zero_handling="offset", rho_offset=C_OFF))
+                           metadata=dict(zero_handling="offset", rho_offset=C_OFF, slab_dex=0.3))
+    rho, theta = (np.asarray(a) for a in _points(ff.FlaxAstroFlow.from_zuko(plain)))
+    assert np.array_equal(off.log_prob(rho, theta), plain.log_prob(rho, theta))
+    assert np.array_equal(off.sample(50, theta[0], seed=3), plain.sample(50, theta[0], seed=3))
     flow = ff.FlaxAstroFlow.from_zuko(off)
-    assert flow.rho_offset == C_OFF
-    rho, theta = (np.asarray(a) for a in _points(flow))
-    y = np.log10(10.0**rho + C_OFF)
-    want = plain.log_prob(y, theta) + np.sum(np.log(10.0**rho / (10.0**rho + C_OFF)), axis=-1)
-    assert np.allclose(off.log_prob(rho, theta), want, rtol=1e-13, atol=1e-12)
+    assert flow.metadata["zero_handling"] == "offset" and flow.metadata["slab_dex"] == 0.3
     assert np.allclose(flow.log_prob(rho, theta), off.log_prob(rho, theta), rtol=1e-12, atol=1e-10)
-    ys, xs = plain.sample(500, theta[0], seed=3), off.sample(500, theta[0], seed=3)
-    valid = 10.0**ys > C_OFF
-    assert np.array_equal(np.isnan(xs), ~valid)
-    assert np.allclose(10.0**xs[valid] + C_OFF, 10.0**ys[valid], rtol=1e-12, atol=0)
 
 
-def _ng20_dir(path, zero_handling="drop", context_first=True):
-    """An ng20astromethods flow directory: torch.save([flow]) plus transform_data.npz."""
+def _ng20_dir(path, zero_handling="drop", context_first=True, slab=True):
+    """An ng20astromethods flow directory: torch.save([flow]) plus transform_data.npz
+    (``slab=False``: saved before the zero slab, without slab_dex / slab_shape)."""
     torch, zf = _zuko()
     torch.manual_seed(3)
     nsf = zf.make_zuko_flow(F, P, hidden_features=[16, 16])
@@ -504,7 +456,9 @@ def _ng20_dir(path, zero_handling="drop", context_first=True):
              half_range=mapping["half_range"], ast_param_idxs=ast, rho_idxs=rho,
              context_param_names=np.array(["a", "b"]), marginalized_param_names=np.array([], dtype=str),
              fobs=np.arange(1, F + 1) / 1e9, tspan=1e9, n_freqs=F, zero_handling=zero_handling,
-             rho_offset=C_OFF, pspace_class="PS_Test")
+             rho_offset=C_OFF, pspace_class="PS_Test",
+             **(dict(slab_dex=0.30103 if zero_handling == "offset" else 0.0, slab_shape="truncnorm")
+                if slab else {}))
     return nsf, mapping
 
 
@@ -518,20 +472,27 @@ def test_load_ng20_flow(tmp_path, zero_handling):
     assert meta["param_names"] == ["a", "b"] and meta["param_space"] == "PS_Test"
     assert np.allclose(meta["f_conv"], np.arange(1, F + 1) / 1e9, rtol=0, atol=0)
     assert meta["tspan"] == 1e9 and meta["zero_handling"] == zero_handling
-    assert meta["marginalized_param_names"] == []
-    assert flow.rho_offset == (C_OFF if zero_handling == "offset" else None)
+    assert meta["marginalized_param_names"] == [] and meta["rho_offset"] == C_OFF
+    assert meta["slab_dex"] == (0.30103 if zero_handling == "offset" else 0.0)
+    assert meta["slab_shape"] == "truncnorm"
 
-    direct = zf.ZukoAstroFlow(nsf, "rho|theta", mapping, P,
-                              metadata=dict(zero_handling=zero_handling, rho_offset=C_OFF))
+    direct = zf.ZukoAstroFlow(nsf, "rho|theta", mapping, P)
     rho, theta = (np.asarray(a) for a in _points(ff.FlaxAstroFlow.from_zuko(direct)))
     assert np.array_equal(flow.log_prob(rho, theta), direct.log_prob(rho, theta))
 
     flow.save(str(tmp_path / "saved"))
     again = load_astro_flow(str(tmp_path / "saved"))
-    assert isinstance(again, zf.ZukoAstroFlow) and again.rho_offset == flow.rho_offset
+    assert isinstance(again, zf.ZukoAstroFlow) and again.metadata["slab_dex"] == meta["slab_dex"]
     assert np.array_equal(again.log_prob(rho, theta), flow.log_prob(rho, theta))
     converted = ff.FlaxAstroFlow.from_zuko(flow)
     assert np.allclose(converted.log_prob(rho, theta), flow.log_prob(rho, theta), rtol=1e-12, atol=1e-10)
+
+
+def test_load_ng20_flow_saved_before_the_slab(tmp_path):
+    """No slab_dex / slab_shape in the file: nothing is invented (AstroGWB reads it as 0 and raises)."""
+    _ng20_dir(str(tmp_path), "offset", slab=False)
+    meta = load_astro_flow(str(tmp_path)).metadata
+    assert meta["zero_handling"] == "offset" and "slab_dex" not in meta and "slab_shape" not in meta
 
 
 def test_load_ng20_flow_needs_context_first(tmp_path):
@@ -548,7 +509,7 @@ def test_load_pandora_nfmaker_flow(tmp_path):
     torch.save([nsf, 5], str(tmp_path / "flow.pkl"))
     np.savez_compressed(str(tmp_path / "x_mapping_data.npy"), **mapping)
     flow = load_astro_flow(str(tmp_path), pickle="flow.pkl", mapping="x_mapping_data.npy.npz")
-    assert "param_names" not in flow.metadata and flow.rho_offset is None
+    assert "param_names" not in flow.metadata
     direct = zf.ZukoAstroFlow(nsf, "rho|theta", mapping, P)
     rho, theta = (np.asarray(a) for a in _points(ff.FlaxAstroFlow.from_zuko(direct)))
     assert np.array_equal(flow.log_prob(rho, theta), direct.log_prob(rho, theta))
