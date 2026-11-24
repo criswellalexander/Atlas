@@ -27,7 +27,8 @@ from ATLAS.nMatrix.base import WhiteCov  # noqa: E402
 from ATLAS.psd_functions import gwb_free_spectrum, hd_orf, powerlaw  # noqa: E402
 from ATLAS.samplers.canetoadracing import MultiHMCGibbs  # noqa: E402
 from ATLAS.signals import signals_utils as sutils  # noqa: E402
-from ATLAS.signals.correlated.astro_gwb import AstroGWB  # noqa: E402
+from ATLAS.astro.flows.flax import FlaxAstroFlow  # noqa: E402
+from ATLAS.signals.correlated.astro_gwb import AstroGWB, set_flow_tspan  # noqa: E402
 
 from . import harness as H  # noqa: E402
 from .test_flax_flows import F, P, _flow  # noqa: E402
@@ -96,6 +97,29 @@ def make_flow(data, kind="coupling_rqs", seed=0):
     return flow
 
 
+def with_metadata(flow, **meta):
+    '''
+
+    The same flow with extra metadata, rebuilt so the constructor sees it
+    (e.g. an offset-mode flow).
+
+    Arguments
+    ------------------------------
+    flow : FlaxAstroFlow
+    	The flow.
+    meta : dict
+    	Metadata entries added to (or replacing) the flow's.
+
+    Returns
+    ------------------------------
+    flow : FlaxAstroFlow
+    	A new flow sharing the weights.
+
+    '''
+    return FlaxAstroFlow(flow.model, flow.nf_type, flow.mapping, flow.n_params,
+                         metadata=dict(flow.metadata, **meta))
+
+
 def build(data, psrs, model_string, flow, common="astro", **astro_kw):
     '''
 
@@ -127,8 +151,7 @@ def build(data, psrs, model_string, flow, common="astro", **astro_kw):
     	The white-noise vector the helpers were built with.
 
     '''
-    lo = flow.mean_gwb - flow.half_range_gwb
-    hi = flow.mean_gwb + flow.half_range_gwb
+    lo, hi = (jnp.asarray(a) for a in flow.log10_rho_training_range())
     kw = dict(irn_psd_function=powerlaw, irn_lower_bound_psd=IRN_LO, irn_upper_bound_psd=IRN_HI,
               gwb_lower_bound_psd=lo, gwb_upper_bound_psd=hi)
     if common == "astro":
@@ -244,6 +267,49 @@ def test_construction_errors(setup):
         AstroGWB(data, flow, astro_lower=jnp.zeros(P + 1))
 
 
+def test_fixed_astro_by_name(setup):
+    data, psrs, flow = setup
+    by_name = AstroGWB(data, flow, fixed_astro={"b": 0.3})
+    by_index = AstroGWB(data, flow, fixed_astro={1: 0.3})
+    assert np.array_equal(by_name.astro_container, by_index.astro_container)
+    assert list(by_name.varied) == [0] and by_name.astro_param_names == ["a"]
+    with pytest.raises(ValueError, match="not flow parameters"):
+        AstroGWB(data, flow, fixed_astro={"c": 0.3})
+
+
+@pytest.mark.parametrize("ratio, policy, outcome", [
+    (1.0, "flow", "set"), (1.0005, "flow", "set"), (0.9, "flow", "warn"), (1.1, "flow", "raise"),
+    (1.0005, "strict", "set"), (0.9, "strict", "raise"), (1.1, "strict", "raise"),
+])
+def test_set_flow_tspan(ratio, policy, outcome):
+    data, _ = make_data()
+    tspan = float(data.pta_tspan)
+    flow = make_flow(data)
+    flow.metadata["tspan"] = ratio * tspan
+    if outcome == "raise":
+        with pytest.raises(ValueError, match="Tspan"):
+            set_flow_tspan(data, flow, policy=policy)
+        assert data.pta_tspan == tspan
+        return
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        assert set_flow_tspan(data, flow, policy=policy) == ratio * tspan
+    assert data.pta_tspan == ratio * tspan
+    assert any("shorter" in str(w.message) for w in caught) == (outcome == "warn")
+
+
+def test_set_flow_tspan_without_tspan():
+    data, _ = make_data()
+    tspan = data.pta_tspan
+    flow = make_flow(data)
+    del flow.metadata["tspan"]
+    with pytest.warns(UserWarning, match="no 'tspan'"):
+        assert set_flow_tspan(data, flow) == float(tspan)
+    assert data.pta_tspan == tspan
+    with pytest.raises(ValueError, match="policy"):
+        set_flow_tspan(data, flow, policy="data")
+
+
 def test_construction_warnings(setup):
     data, psrs, flow = setup
     lo, hi = flow.mean_gwb - flow.half_range_gwb, flow.mean_gwb + flow.half_range_gwb
@@ -263,8 +329,64 @@ def test_construction_warnings(setup):
 # ---- exact joint density --------------------------------------------------------------
 
 def extra_log_prior(theta):
-    # a Gaussian on the first varied parameter, to exercise astro_log_prior
-    return -0.5 * ((theta[0] - 0.1) / 0.7) ** 2
+    # Gaussians on every context parameter (fixed ones included), to exercise astro_log_prior
+    return -0.5 * jnp.sum(((theta - 0.1) / 0.7) ** 2)
+
+
+def assert_hyperprior_identity(data, psrs, flow, model_string, marg, vary_white, **astro_kw):
+    '''
+
+    log p_astro - log p_cor = log p_flow(rho | theta) + astro_log_prior(theta)
+    - sum log(theta box widths), at the same site values; the cor model has
+    a free-spectrum HD block with the flow's training range as its box.
+
+    Arguments
+    ------------------------------
+    data : ATLAS.data.PTA_Data
+    	The data.
+    psrs : list
+    	The pulsars.
+    flow : FlaxAstroFlow
+    	The astro flow.
+    model_string : str
+    	Combination string written with 'astro'.
+    marg : bool
+    	marg_over_non_gwb branch.
+    vary_white : bool
+    	Sample the white noise (helpers rebuilt in the model).
+    astro_kw : dict
+    	Astro keywords of `make_red_noise` (astro_log_prior, fixed_astro, ...).
+
+    Returns
+    ------------------------------
+    sig : AstroGWB
+    	The astro signal of the model checked.
+
+    '''
+    rn_a, helpers_a, wn_vec = build(data, psrs, model_string, flow, **astro_kw)
+    rn_c, helpers_c, _ = build(data, psrs, model_string, flow, common="cor")
+    sig = rn_a.astro_signal
+
+    params = point(rn_a, flow, marg)
+    params["astro_params"] = params["astro_params"][sig.varied]
+    if vary_white:
+        params["white_noise"] = wn_vec
+    got = float(log_density(model_maker, (), maker_kwargs(rn_a, helpers_a, wn_vec, marg, vary_white),
+                            params)[0])
+    ref_params = {k: v for k, v in params.items() if k != "astro_params"}
+    ref = float(log_density(model_maker, (), maker_kwargs(rn_c, helpers_c, wn_vec, marg, vary_white),
+                            ref_params)[0])
+
+    theta_full = np.asarray(sig.astro_container).copy()
+    theta_full[sig.varied] = np.asarray(params["astro_params"])
+    rho = params["red_noise"][rn_a.common_param_slice]
+    extra = astro_kw.get("astro_log_prior")
+    expected = (float(flow.log_prob(rho, jnp.asarray(theta_full)))
+                + (float(extra(jnp.asarray(theta_full))) if extra is not None else 0.0)
+                - float(np.sum(np.log(np.asarray(sig.astro_upper) - np.asarray(sig.astro_lower)))))
+    assert np.isfinite(expected)
+    assert abs((got - ref) - expected) <= TIGHT * max(abs(got), abs(ref))
+    return sig
 
 
 @pytest.mark.parametrize("fixed", [False, True], ids=["all-varied", "one-fixed"])
@@ -300,27 +422,73 @@ def test_log_density_adds_exactly_the_hyperprior(setup, marg, model_string, vary
     astro_kw = dict(astro_log_prior=extra_log_prior)
     if fixed:
         astro_kw["fixed_astro"] = {0: float(flow.mean_ast[0]) + 0.05}
-    rn_a, helpers_a, wn_vec = build(data, psrs, model_string, flow, **astro_kw)
-    rn_c, helpers_c, _ = build(data, psrs, model_string, flow, common="cor")
-    sig = rn_a.astro_signal
+    assert_hyperprior_identity(data, psrs, flow, model_string, marg, vary_white, **astro_kw)
 
-    params = point(rn_a, flow, marg)
-    params["astro_params"] = params["astro_params"][sig.varied]
-    if vary_white:
-        params["white_noise"] = wn_vec
-    got = float(log_density(model_maker, (), maker_kwargs(rn_a, helpers_a, wn_vec, marg, vary_white),
-                            params)[0])
-    ref_params = {k: v for k, v in params.items() if k != "astro_params"}
-    ref = float(log_density(model_maker, (), maker_kwargs(rn_c, helpers_c, wn_vec, marg, vary_white),
-                            ref_params)[0])
 
-    theta_full = np.asarray(sig.astro_container).copy()
-    theta_full[sig.varied] = np.asarray(params["astro_params"])
-    rho = params["red_noise"][rn_a.common_param_slice]
-    expected = (float(flow.log_prob(rho, jnp.asarray(theta_full)))
-                + float(extra_log_prior(params["astro_params"]))
-                - float(np.sum(np.log(np.asarray(sig.astro_upper) - np.asarray(sig.astro_lower)))))
-    assert abs((got - ref) - expected) <= TIGHT * max(abs(got), abs(ref))
+@pytest.mark.parametrize("marg", [False, True], ids=["reparam", "partial-marg"])
+def test_pspace_prior_and_named_fixed_parameter(setup, marg):
+    '''
+
+    The holodeck pspace prior plugs in as astro_log_prior, with a parameter
+    fixed by name. The flow's context is two of Pandora's phenom parameters
+    (normal priors, so finite anywhere); the other four are marginalized.
+
+    Arguments
+    ------------------------------
+    setup : tuple
+    	Module fixture (data, pulsars, flow).
+    marg : bool
+    	marg_over_non_gwb branch.
+
+    Returns
+    ------------------------------
+    None
+
+    '''
+    pytest.importorskip("holodeck")
+    from ATLAS.astro.priors import pspace_log_prior
+
+    data, psrs, flow = setup
+    names = ["gsmf_phi0_log10", "mmb_scatter_dex"]
+    flow = with_metadata(flow, param_names=names, param_space="PS_Pandora_Phenom")
+    lp = pspace_log_prior(flow.metadata["param_space"], flow.metadata["param_names"])
+    sig = assert_hyperprior_identity(data, psrs, flow, "ltm|unc+astro->unc", marg, False,
+                                     astro_log_prior=lp,
+                                     fixed_astro={"gsmf_phi0_log10": float(flow.mean_ast[0])})
+    assert list(sig.varied) == [1] and sig.astro_param_names == ["mmb_scatter_dex"]
+
+
+@pytest.mark.parametrize("model_string", ["ltm|unc+astro->unc", "ltm|unc;astro"],
+                         ids=["nested", "separate"])
+def test_offset_flow_in_the_model(setup, model_string):
+    '''
+
+    An offset-mode flow (y = log10(rho + c)) keeps the exact identity, and
+    its default rho box is the training range mapped back to log10 rho, with
+    the lower edge at the fallback where the range reaches rho <= 0.
+
+    Arguments
+    ------------------------------
+    setup : tuple
+    	Module fixture (data, pulsars, flow).
+    model_string : str
+    	Nested or separate common-process layout.
+
+    Returns
+    ------------------------------
+    None
+
+    '''
+    data, psrs, flow = setup
+    # c at the middle of the first bin's training range, so that bin's range reaches rho <= 0
+    c = float(10.0 ** (flow.mean_gwb[0] - 0.5 * flow.half_range_gwb[0]))
+    offset = with_metadata(flow, zero_handling="offset", rho_offset=c)
+    lo, hi = offset.log10_rho_training_range()
+    assert lo[0] == -12.0 and np.all(np.isfinite(lo)) and np.all(lo < hi)
+    rn, _, _ = build(data, psrs, model_string, offset)
+    assert np.array_equal(np.asarray(rn.model.lower_prior_lim_all)[rn.common_param_slice], lo)
+    assert_hyperprior_identity(data, psrs, offset, model_string, True, False,
+                               astro_log_prior=extra_log_prior)
 
 
 def test_all_theta_fixed_has_no_site(setup):
@@ -381,8 +549,9 @@ def test_log_prior_matches_standalone_model():
                           rNr=rNr, logdet_N=logdet_N)
     fixed = {1: float(flow.mean_ast[1])}
     lo, hi = flow.mean_ast - flow.half_range_ast, flow.mean_ast + flow.half_range_ast
-    standalone = AstroInferenceModel(red, flow, lo, hi, astro_log_prior=extra_log_prior,
-                                     fixed_astro=fixed)
+    # the standalone model passes the varied theta (Pandora's convention)
+    standalone = AstroInferenceModel(red, flow, lo, hi, fixed_astro=fixed,
+                                     astro_log_prior=lambda tv: extra_log_prior(standalone.full_astro(tv)))
     rn_a, _, _ = build(data, psrs, "unc+astro->unc", flow, fixed_astro=fixed,
                        astro_log_prior=extra_log_prior)
 

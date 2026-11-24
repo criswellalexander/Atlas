@@ -333,6 +333,9 @@ class ZukoAstroFlow:
     device : str, optional
     metadata : dict, optional
         Kept in the saved config (``param_names``, ``f_conv``, ``tspan``, ...).
+        With ``zero_handling='offset'`` and ``rho_offset`` (ng20astromethods
+        flows), the flow models ``y = log10(rho + rho_offset)`` and is
+        evaluated and sampled in ``log10_rho`` here.
     """
 
     def __init__(self, flow, nf_type, mapping, n_params, device="cpu", metadata=None):
@@ -348,6 +351,10 @@ class ZukoAstroFlow:
         self.mean_ast, self.mean_gwb = mean[:p], mean[p:]
         self.half_range_ast, self.half_range_gwb = half[:p], half[p:]
         self.metadata = dict(metadata or {})
+        # Offset-mode flows model y = log10(rho + c); ng20 files store rho_offset
+        # whatever the mode, so the mode decides
+        self.rho_offset = (float(self.metadata["rho_offset"])
+                           if self.metadata.get("zero_handling") == "offset" else None)
 
     @property
     def mapping(self):
@@ -357,13 +364,21 @@ class ZukoAstroFlow:
     # ---- physical <-> normalized ----------------------------------------------
 
     def transform_rho_to_scaled_interval(self, gwb_rho):
+        if self.rho_offset is not None:
+            gwb_rho = np.log10(10.0**gwb_rho + self.rho_offset)
         return self.B * (gwb_rho - self.mean_gwb) / self.half_range_gwb
 
     def transform_params_to_scaled_interval(self, ast_params):
         return self.B * (ast_params - self.mean_ast) / self.half_range_ast
 
     def transform_rho_to_physical_interval(self, gwb_rho):
-        return gwb_rho * self.half_range_gwb / self.B + self.mean_gwb
+        out = gwb_rho * self.half_range_gwb / self.B + self.mean_gwb
+        if self.rho_offset is not None:
+            # back from y = log10(rho + c); NaN where rho = 10^y - c <= 0
+            with np.errstate(invalid="ignore", divide="ignore"):
+                out = np.log10(10.0**out - self.rho_offset)
+            out = np.where(np.isfinite(out), out, np.nan)
+        return out
 
     def transform_params_to_physical_interval(self, ast_params):
         return ast_params * self.half_range_ast / self.B + self.mean_ast
@@ -390,7 +405,9 @@ class ZukoAstroFlow:
             Required unless ``nf_type='rho'``.
         jacobian : bool
             Include the Jacobian of the map to ``[-B, B]``, giving the
-            density in physical units. ``False`` reproduces Pandora.
+            density in physical units. ``False`` reproduces Pandora. An
+            offset-mode flow always includes the (non-constant) Jacobian of
+            ``log10(rho + c)``.
 
         Returns
         -------
@@ -407,6 +424,10 @@ class ZukoAstroFlow:
             else:
                 lp = self.flow(scaled_gwb).log_prob(scaled_ast)
         lp = lp.cpu().numpy()
+        if self.rho_offset is not None and self.nf_type != "theta|rho":
+            # dy/dlog10_rho = rho / (rho + c) for y = log10(rho + c), as in run_pandora
+            rho = 10.0 ** np.asarray(log10_rho, dtype=np.float64)
+            lp = lp + np.sum(np.log(rho / (rho + self.rho_offset)), axis=-1)
         return lp + self.log_jacobian() if jacobian else lp
 
     @torch.no_grad()
@@ -484,8 +505,13 @@ class ZukoAstroFlow:
             from ``AstroInferenceUpdated.ipynb``. Unpickling runs code from
             the file, so only load files you trust.
         mapping_path : str
-            Pandora's ``*_mapping_data.npy.npz`` (``B``, ``mean``, ``half_range``).
+            Pandora's ``*_mapping_data.npy.npz`` (``B``, ``mean``, ``half_range``),
+            or ng20astromethods' ``transform_data.npz``, whose description of
+            the flow (context names, ``fobs``, ``tspan``, ``pspace_class``,
+            zero handling) becomes the metadata.
         nf_type : str
+        metadata : dict, optional
+            Overrides the metadata read from the mapping file.
 
         The flow is rebuilt from its inferred architecture and the pickled
         weights, so it can be re-saved with :meth:`save`.
@@ -494,6 +520,15 @@ class ZukoAstroFlow:
         pickled = obj[0] if isinstance(obj, (list, tuple)) else obj
         with np.load(mapping_path) as m:
             mapping = dict(B=m["B"][()], mean=m["mean"], half_range=m["half_range"])
+            found = {_NG20_KEYS[k]: (m[k].item() if m[k].ndim == 0 else m[k].tolist())
+                     for k in m.files if k in _NG20_KEYS}
+            if "ast_param_idxs" in m.files:
+                # Atlas keeps the astrophysical parameters first, as ng20 writes them
+                ast, rho = m["ast_param_idxs"], m["rho_idxs"]
+                if not (np.array_equal(ast, np.arange(len(ast)))
+                        and np.array_equal(rho, np.arange(len(ast), len(ast) + len(rho)))):
+                    raise ValueError(f"{mapping_path}: expected the context parameters first, "
+                                     f"got ast_param_idxs={ast} and rho_idxs={rho}")
         if isinstance(obj, (list, tuple)) and len(obj) > 1 and obj[1] != mapping["B"]:
             raise ValueError(f"pickle has B={obj[1]} but the mapping has B={mapping['B']}")
         arch = _flow_architecture(pickled)
@@ -502,7 +537,13 @@ class ZukoAstroFlow:
         n_total = len(mapping["mean"])
         n_params = arch["n_features"] if nf_type == "theta|rho" else n_total - arch["n_features"]
         return cls(flow, nf_type, mapping, n_params, device=device,
-                   metadata=dict(metadata or {}, source=os.path.abspath(pickle_path)))
+                   metadata=dict(found, **(metadata or {}), source=os.path.abspath(pickle_path)))
+
+
+# ng20astromethods' transform_data.npz key -> Atlas metadata key
+_NG20_KEYS = dict(context_param_names="param_names", fobs="f_conv", tspan="tspan",
+                  pspace_class="param_space", zero_handling="zero_handling",
+                  rho_offset="rho_offset", marginalized_param_names="marginalized_param_names")
 
 
 def _jsonable(obj):

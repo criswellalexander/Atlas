@@ -8,6 +8,7 @@ from identical initial weights and batches.
 """
 import copy
 import os
+import sys
 
 import numpy as np
 import pytest
@@ -19,7 +20,8 @@ import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
 from flax import nnx  # noqa: E402
 
-from ATLAS.astro.flows import train, trainset  # noqa: E402
+import ATLAS.astro.flows as flows_pkg  # noqa: E402
+from ATLAS.astro.flows import load_astro_flow, train, trainset  # noqa: E402
 from ATLAS.astro.flows import flax as ff  # noqa: E402
 
 pytestmark = pytest.mark.astro
@@ -160,6 +162,92 @@ def test_flow_distribution():
     assert np.all(np.abs(nuts.mean(0) - direct.mean(0)) < 4 * se)
 
 
+# ---- offset-mode flows (ng20astromethods zero_handling='offset') -------------------------------
+
+C_OFF = 10.0 ** -8.5
+
+
+def _with_meta(flow, **meta):
+    return ff.FlaxAstroFlow(flow.model, flow.nf_type, flow.mapping, flow.n_params,
+                            metadata=dict(flow.metadata, **meta))
+
+
+@pytest.mark.parametrize("nf_type", ff.NF_TYPES)
+def test_offset_flow_log_prob(nf_type):
+    """The flow models y = log10(rho + c): density of y at y(rho), times |dy/dlog10_rho| when
+    rho is the modelled variable (whatever `jacobian` says); only mapped when it is the context."""
+    flow = _flow(nf_type=nf_type)
+    off = _with_meta(flow, zero_handling="offset", rho_offset=C_OFF)
+    rho, theta = _points(flow)
+    y = jnp.log10(10.0**rho + C_OFF)
+    th = None if nf_type == "rho" else theta
+    for jac in (True, False):
+        want = flow.log_prob(y, th, jacobian=jac)
+        if nf_type != "theta|rho":
+            want = want + jnp.sum(jnp.log(10.0**rho / (10.0**rho + C_OFF)), axis=-1)
+        assert np.allclose(off.log_prob(rho, th, jacobian=jac), want, rtol=1e-13, atol=1e-12)
+
+
+def test_offset_flow_sample():
+    flow = _flow()
+    off = _with_meta(flow, zero_handling="offset", rho_offset=C_OFF)
+    _, theta = _points(flow)
+    key = jax.random.key(0)
+    y = np.asarray(flow.sample(key, (4000,), theta[0]))
+    x = np.asarray(off.sample(key, (4000,), theta[0]))
+    valid = 10.0**y > C_OFF
+    assert valid.any() and not valid.all()
+    assert np.array_equal(np.isnan(x), ~valid)
+    assert np.allclose(10.0**x[valid] + C_OFF, 10.0**y[valid], rtol=1e-12, atol=0)
+
+
+def test_offset_training_range_and_persistence(tmp_path):
+    flow = _flow()
+    y_lo = np.asarray(flow.mean_gwb - flow.half_range_gwb)
+    y_hi = np.asarray(flow.mean_gwb + flow.half_range_gwb)
+    lo, hi = flow.log10_rho_training_range()
+    assert np.array_equal(lo, y_lo) and np.array_equal(hi, y_hi)
+
+    c = 10.0 ** (y_lo[0] + 0.1)                 # the first bin's range reaches rho <= 0
+    off = _with_meta(flow, zero_handling="offset", rho_offset=c)
+    lo, hi = off.log10_rho_training_range(lower_fallback=-13.0)
+    with np.errstate(invalid="ignore"):
+        want_lo = np.log10(10.0**y_lo - c)
+    want_lo = np.where(np.isfinite(want_lo), want_lo, -13.0)
+    assert lo[0] == -13.0 and np.allclose(lo, want_lo, rtol=1e-14)
+    assert np.allclose(hi, np.log10(10.0**y_hi - c), rtol=1e-14)
+
+    off.save(str(tmp_path))
+    again = load_astro_flow(str(tmp_path))
+    assert isinstance(again, ff.FlaxAstroFlow) and again.rho_offset == c
+    rho, theta = _points(flow)
+    assert np.array_equal(again.log_prob(rho, theta), off.log_prob(rho, theta))
+
+
+def test_drop_flow_ignores_rho_offset():
+    """ng20 files store rho_offset whatever the zero handling; 'drop' flows are unchanged."""
+    flow = _flow()
+    drop = _with_meta(flow, zero_handling="drop", rho_offset=1e-9)
+    assert drop.rho_offset is None
+    rho, theta = _points(flow)
+    assert np.array_equal(drop.log_prob(rho, theta), flow.log_prob(rho, theta))
+    key = jax.random.key(2)
+    assert np.array_equal(drop.sample(key, (5,), theta[0]), flow.sample(key, (5,), theta[0]))
+
+
+def test_load_astro_flow_errors(tmp_path, monkeypatch):
+    with pytest.raises(FileNotFoundError, match="neither"):
+        load_astro_flow(str(tmp_path))
+    with pytest.raises(ValueError, match="both pickle and mapping"):
+        load_astro_flow(mapping="m.npz")
+    # a torch-backed format without torch: the zuko module cannot be imported
+    np.savez(str(tmp_path / "transform_data.npz"), B=5.0)
+    monkeypatch.setitem(sys.modules, "ATLAS.astro.flows.zuko", None)
+    monkeypatch.delattr(flows_pkg, "zuko", raising=False)
+    with pytest.raises(ImportError, match="torch and zuko"):
+        load_astro_flow(str(tmp_path))
+
+
 # ---- training ---------------------------------------------------------------------------------
 
 def _gaussian_data(n, seed):
@@ -254,7 +342,8 @@ def _small_set(n_draws=10, n_real=60, seed=0):
     rho = (-8 + 0.3 * rng.normal(size=(n_draws, n_real, F))
            + 0.2 * params[:, None, :1] - 0.1 * np.arange(F))
     return trainset.TrainingSet(params=params, log10_rho=rho, param_names=["a", "b"],
-                             f_conv=np.arange(1, F + 1) / 1e9, tspan=1e9)
+                             f_conv=np.arange(1, F + 1) / 1e9, tspan=1e9,
+                             metadata=dict(param_space="PS_Test"))
 
 
 @pytest.mark.parametrize("arch", ["zuko_nsf", "coupling_rqs"])
@@ -275,6 +364,7 @@ def test_train_astro_flow_flax_end_to_end(tmp_path, arch):
     reloaded = ff.FlaxAstroFlow.load(out)
     assert np.array_equal(reloaded.log_prob(rho, theta), flow.log_prob(rho, theta))
     assert reloaded.metadata["param_names"] == ["a", "b"]
+    assert reloaded.metadata["param_space"] == "PS_Test"
     ckpt = ff.FlaxAstroFlow.load(out, params="flow_299steps.npz")
     assert np.array_equal(ckpt.log_prob(rho, theta), flow.log_prob(rho, theta))
 
@@ -380,6 +470,93 @@ def test_from_zuko_astro_flow(nf_type):
     assert np.allclose(flow.log_prob(rho, th), zflow.log_prob(np.asarray(rho), th),
                        rtol=1e-12, atol=1e-11)
     assert flow.metadata["param_names"] == ["a", "b"]
+
+
+def test_offset_zuko_flow_matches_flax():
+    torch, zf = _zuko()
+    torch.manual_seed(1)
+    nsf = zf.make_zuko_flow(F, P, hidden_features=[16, 16])
+    plain = zf.ZukoAstroFlow(nsf, "rho|theta", _mapping(1), P)
+    off = zf.ZukoAstroFlow(nsf, "rho|theta", _mapping(1), P,
+                           metadata=dict(zero_handling="offset", rho_offset=C_OFF))
+    flow = ff.FlaxAstroFlow.from_zuko(off)
+    assert flow.rho_offset == C_OFF
+    rho, theta = (np.asarray(a) for a in _points(flow))
+    y = np.log10(10.0**rho + C_OFF)
+    want = plain.log_prob(y, theta) + np.sum(np.log(10.0**rho / (10.0**rho + C_OFF)), axis=-1)
+    assert np.allclose(off.log_prob(rho, theta), want, rtol=1e-13, atol=1e-12)
+    assert np.allclose(flow.log_prob(rho, theta), off.log_prob(rho, theta), rtol=1e-12, atol=1e-10)
+    ys, xs = plain.sample(500, theta[0], seed=3), off.sample(500, theta[0], seed=3)
+    valid = 10.0**ys > C_OFF
+    assert np.array_equal(np.isnan(xs), ~valid)
+    assert np.allclose(10.0**xs[valid] + C_OFF, 10.0**ys[valid], rtol=1e-12, atol=0)
+
+
+def _ng20_dir(path, zero_handling="drop", context_first=True):
+    """An ng20astromethods flow directory: torch.save([flow]) plus transform_data.npz."""
+    torch, zf = _zuko()
+    torch.manual_seed(3)
+    nsf = zf.make_zuko_flow(F, P, hidden_features=[16, 16])
+    mapping = _mapping(3)
+    torch.save([nsf], os.path.join(path, "zuko_flow.pkl"))
+    ast, rho = (np.arange(P), np.arange(P, P + F)) if context_first else (np.arange(F, F + P), np.arange(F))
+    np.savez(os.path.join(path, "transform_data.npz"), B=5.0, mean=mapping["mean"],
+             half_range=mapping["half_range"], ast_param_idxs=ast, rho_idxs=rho,
+             context_param_names=np.array(["a", "b"]), marginalized_param_names=np.array([], dtype=str),
+             fobs=np.arange(1, F + 1) / 1e9, tspan=1e9, n_freqs=F, zero_handling=zero_handling,
+             rho_offset=C_OFF, pspace_class="PS_Test")
+    return nsf, mapping
+
+
+@pytest.mark.parametrize("zero_handling", ["drop", "offset"])
+def test_load_ng20_flow(tmp_path, zero_handling):
+    torch, zf = _zuko()
+    nsf, mapping = _ng20_dir(str(tmp_path), zero_handling)
+    flow = load_astro_flow(str(tmp_path))
+    assert isinstance(flow, zf.ZukoAstroFlow)
+    meta = flow.metadata
+    assert meta["param_names"] == ["a", "b"] and meta["param_space"] == "PS_Test"
+    assert np.allclose(meta["f_conv"], np.arange(1, F + 1) / 1e9, rtol=0, atol=0)
+    assert meta["tspan"] == 1e9 and meta["zero_handling"] == zero_handling
+    assert meta["marginalized_param_names"] == []
+    assert flow.rho_offset == (C_OFF if zero_handling == "offset" else None)
+
+    direct = zf.ZukoAstroFlow(nsf, "rho|theta", mapping, P,
+                              metadata=dict(zero_handling=zero_handling, rho_offset=C_OFF))
+    rho, theta = (np.asarray(a) for a in _points(ff.FlaxAstroFlow.from_zuko(direct)))
+    assert np.array_equal(flow.log_prob(rho, theta), direct.log_prob(rho, theta))
+
+    flow.save(str(tmp_path / "saved"))
+    again = load_astro_flow(str(tmp_path / "saved"))
+    assert isinstance(again, zf.ZukoAstroFlow) and again.rho_offset == flow.rho_offset
+    assert np.array_equal(again.log_prob(rho, theta), flow.log_prob(rho, theta))
+    converted = ff.FlaxAstroFlow.from_zuko(flow)
+    assert np.allclose(converted.log_prob(rho, theta), flow.log_prob(rho, theta), rtol=1e-12, atol=1e-10)
+
+
+def test_load_ng20_flow_needs_context_first(tmp_path):
+    _ng20_dir(str(tmp_path), context_first=False)
+    with pytest.raises(ValueError, match="context parameters first"):
+        load_astro_flow(str(tmp_path))
+
+
+def test_load_pandora_nfmaker_flow(tmp_path):
+    torch, zf = _zuko()
+    torch.manual_seed(4)
+    nsf = zf.make_zuko_flow(F, P, hidden_features=[16, 16])
+    mapping = _mapping(4)
+    torch.save([nsf, 5], str(tmp_path / "flow.pkl"))
+    np.savez_compressed(str(tmp_path / "x_mapping_data.npy"), **mapping)
+    flow = load_astro_flow(str(tmp_path), pickle="flow.pkl", mapping="x_mapping_data.npy.npz")
+    assert "param_names" not in flow.metadata and flow.rho_offset is None
+    direct = zf.ZukoAstroFlow(nsf, "rho|theta", mapping, P)
+    rho, theta = (np.asarray(a) for a in _points(ff.FlaxAstroFlow.from_zuko(direct)))
+    assert np.array_equal(flow.log_prob(rho, theta), direct.log_prob(rho, theta))
+
+    direct.save(str(tmp_path / "zdir"))
+    again = load_astro_flow(str(tmp_path / "zdir"))
+    assert isinstance(again, zf.ZukoAstroFlow)
+    assert np.array_equal(again.log_prob(rho, theta), direct.log_prob(rho, theta))
 
 
 def test_pandora_pickle_through_conversion(tmp_path):

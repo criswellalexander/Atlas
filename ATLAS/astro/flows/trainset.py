@@ -725,6 +725,8 @@ def load_holodeck_library(path, n_freqs, tspan=None, freqs=None, hc_floor=1e-20)
         names = [n.decode() if isinstance(n, bytes) else str(n)
                  for n in h5.attrs["param_names"]]
         edges = h5["fobs_edges"][()] if "fobs_edges" in h5 else None
+        pspace = h5.attrs.get("parameter_space_class_name")
+        pspace = pspace.decode() if isinstance(pspace, bytes) else pspace
 
     if tspan is None:
         if edges is None:
@@ -740,7 +742,8 @@ def load_holodeck_library(path, n_freqs, tspan=None, freqs=None, hc_floor=1e-20)
     rho = hc_to_log10_rho(hc.transpose((0, 2, 1)), f_conv[None, None, :], tspan)
     meta = dict(source=os.path.abspath(path), tspan=float(tspan), n_freqs=int(n_freqs),
                 freqs="default" if freqs is None else "array",
-                f_conv=f_conv.tolist(), hc_floor=hc_floor, param_names=names)
+                f_conv=f_conv.tolist(), hc_floor=hc_floor, param_names=names,
+                param_space=None if pspace is None else str(pspace))
     return TrainingSet(params=params, log10_rho=rho, param_names=names, f_conv=f_conv,
                        tspan=float(tspan), metadata=meta)
 

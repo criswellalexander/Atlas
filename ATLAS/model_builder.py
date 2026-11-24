@@ -251,16 +251,18 @@ class ModelBuilder:
             basis column per pulsar.  When None the GTM PSD is held at unit
             variance and no GTM parameters are sampled.
         astro_flow : FlaxAstroFlow or ZukoAstroFlow, optional
-            Trained ``'rho|theta'`` flow; required for ``'astro'``.  A zuko
-            flow is converted to flax.
+            Trained ``'rho|theta'`` flow (e.g. from
+            ``ATLAS.astro.flows.load_astro_flow``); required for ``'astro'``.
+            A zuko flow is converted to flax.
         astro_lower_bound, astro_upper_bound : array, optional
             Uniform prior bounds of the varied astrophysical parameters; None
             uses the flow's training range.
         astro_log_prior : callable, optional
-            Extra JAX-traceable log prior on the varied astrophysical
-            parameters.
+            Extra JAX-traceable log prior on the astrophysical parameters,
+            called with the full theta in the flow's context order, e.g.
+            ``ATLAS.astro.priors.pspace_log_prior``.
         fixed_astro : dict, optional
-            ``{index: value}`` of astrophysical parameters held fixed.
+            ``{index or name: value}`` of astrophysical parameters held fixed.
 
         Returns
         -------

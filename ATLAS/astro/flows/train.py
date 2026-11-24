@@ -99,6 +99,9 @@ def train_astro_flow(training_set, save_dir, nf_type="rho|theta", B=5, val=None,
                     f_conv=None if training_set.f_conv is None else list(training_set.f_conv),
                     tspan=training_set.tspan)
     flow_meta = {k: metadata[k] for k in ("param_names", "f_conv", "tspan")}
+    # the holodeck parameter space, so pspace_log_prior can find the prior on theta
+    if training_set.metadata.get("param_space") is not None:
+        flow_meta["param_space"] = training_set.metadata["param_space"]
     if backend == "flax":
         from ATLAS.astro.flows import flax as ff
 

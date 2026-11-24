@@ -293,24 +293,41 @@ everything else. It needs the `[astro]` extra and a `'rho|theta'` flow, e.g. one
 trained with `ATLAS.astro.flows.train.train_astro_flow`:
 
 ```python
-from ATLAS.astro.flows.flax import FlaxAstroFlow
+from ATLAS.astro.flows import load_astro_flow
+from ATLAS.astro.priors import pspace_log_prior
+from ATLAS.signals.correlated.astro_gwb import set_flow_tspan
 
-flow = FlaxAstroFlow.load("my_flow/")       # or a ZukoAstroFlow, converted to flax
-data.pta_tspan = flow.metadata["tspan"]     # the flow fixes the GWB frequencies
+flow = load_astro_flow("my_flow/")          # Atlas, ng20astromethods or Pandora flow
+set_flow_tspan(data, flow)                  # the flow fixes the GWB frequencies
 rn = ModelBuilder(data=data).make_red_noise(
     "ltm|unc+astro->unc", irn_psd_function=powerlaw,
     irn_lower_bound_psd=..., irn_upper_bound_psd=...,
-    astro_flow=flow)
+    astro_flow=flow,
+    astro_log_prior=pspace_log_prior(flow.metadata["param_space"],
+                                     flow.metadata["param_names"]),
+    fixed_astro={"mmb_zplaw_amp": 0.0})
 mcmc.run(..., super_sig=rn, marg_over_non_gwb=True)
 ```
 
-- The number of background bins is the flow's. `pta_tspan` must equal the
-  flow's training span, set before the model is built, since every Fourier
-  basis uses it. A mismatch raises.
+- `load_astro_flow` reads a directory saved by `FlaxAstroFlow.save` or
+  `ZukoAstroFlow.save`, an ng20astromethods directory (`zuko_flow.pkl` +
+  `transform_data.npz`, whose metadata it keeps), or a Pandora pickle and
+  mapping (`pickle=..., mapping=...`). All but flax need torch; pickles run
+  code when loaded, so only load trusted files. Flows trained with
+  `zero_handling='offset'` (on log10(rho + c)) are evaluated in log10 rho.
+- The number of background bins is the flow's. `set_flow_tspan` sets
+  `data.pta_tspan` to the flow's training span, which every Fourier basis
+  uses, so call it before building the model. It warns if the flow's span is
+  shorter than the data's and raises if it is longer (`policy='strict'`
+  raises on any mismatch beyond `rtol`). A frequency mismatch raises.
 - By default, the uniform boxes on log10 rho (`gwb_lower/upper_bound_psd`) and
   on theta (`astro_lower/upper_bound`) are the flow's training ranges.
-- `fixed_astro={index: value}` holds parameters fixed, and `astro_log_prior` adds
-  a JAX-traceable prior on the varied ones.
+- `fixed_astro={index or name: value}` holds parameters fixed, and
+  `astro_log_prior` adds a JAX-traceable prior, called with the full theta in
+  the flow's context order. `pspace_log_prior` is the holodeck parameter-space
+  prior (uniform, normal, multivariate normal and 2D hardening terms, as in
+  run_pandora); a parameter space Atlas trained on is recorded in the flow's
+  `param_space`.
 - `model_maker` adds the site `astro_params` and the factor `astro_hyperprior`;
   with `MultiHMCGibbs`, put `astro_params` in one of the groups.
 - The rho parameters are named `astro_halflog10_rho_i`.

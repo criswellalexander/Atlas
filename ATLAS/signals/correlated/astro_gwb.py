@@ -1,3 +1,4 @@
+import logging
 import warnings
 
 import numpy as np
@@ -5,6 +6,8 @@ import jax.numpy as jnp
 
 from ATLAS import psd_functions
 from ATLAS.signals.correlated.base import Correlated
+
+log = logging.getLogger(__name__)
 
 
 class AstroGWB(Correlated):
@@ -20,7 +23,8 @@ class AstroGWB(Correlated):
 
     The sampled amplitudes are ``halflog10_rho = 0.5*log10(<a^T a>)``, which is
     the flow's log10_rho. The frequency bins are those the flow was trained at:
-    ``data.pta_tspan`` must equal the flow's training Tspan.
+    ``data.pta_tspan`` must equal the flow's training Tspan (``set_flow_tspan``
+    sets it).
 
     Arguments
     ------------------------------
@@ -33,10 +37,10 @@ class AstroGWB(Correlated):
     	Signal name used in the combination string. (Default: 'astro')
     lower_bound_psd : array_like or None
     	Lower prior bounds on the halflog10_rho of each bin; None uses the
-    	flow's training range, mean - half_range. (Default: None)
+    	flow's training range (``flow.log10_rho_training_range``). (Default: None)
     upper_bound_psd : array_like or None
     	Upper prior bounds on the halflog10_rho of each bin; None uses the
-    	flow's training range, mean + half_range. (Default: None)
+    	flow's training range. (Default: None)
     astro_lower : array_like or None
     	Lower uniform prior bounds of the varied astrophysical parameters (a
     	full-length array is also accepted); None uses the flow's training
@@ -45,15 +49,20 @@ class AstroGWB(Correlated):
     	Upper uniform prior bounds of the varied astrophysical parameters, as
     	for ``astro_lower``. (Default: None)
     astro_log_prior : callable or None
-    	Extra log prior ``f(theta_varied) -> scalar`` on the varied
-    	astrophysical parameters, e.g. Gaussians; it must be traceable by JAX.
-    	(Default: None)
+    	Extra log prior ``f(theta) -> scalar`` on the astrophysical
+    	parameters, called with the full theta in the flow's context order
+    	(fixed values included), e.g. ``ATLAS.astro.priors.pspace_log_prior``;
+    	it must be traceable by JAX. (Default: None)
     fixed_astro : dict or None
-    	``{index: value}`` of astrophysical parameters held fixed, indexed in
-    	the flow's context order. (Default: None)
+    	``{index or name: value}`` of astrophysical parameters held fixed,
+    	indexed in the flow's context order or named as in its
+    	``param_names``. (Default: None)
     freq_rtol : float
     	Relative tolerance when matching the flow's training frequencies to
     	the model's. (Default: 1e-10)
+    rho_lower_fallback : float
+    	Lower halflog10_rho edge of the default box where an offset-mode
+    	flow's training range reaches rho <= 0. (Default: -12.0)
 
     Returns
     ------------------------------
@@ -74,7 +83,8 @@ class AstroGWB(Correlated):
                  astro_upper=None,
                  astro_log_prior=None,
                  fixed_astro=None,
-                 freq_rtol=1e-10):
+                 freq_rtol=1e-10,
+                 rho_lower_fallback=-12.0):
         # Flax (and zuko, for conversion) are [astro] extras: import them here
         # so the core never needs them.
         from ATLAS.astro.flows.flax import FlaxAstroFlow
@@ -87,8 +97,7 @@ class AstroGWB(Correlated):
         nfreqs = flow.n_freqs
 
         # Training ranges of log10_rho and theta, in physical units
-        train_lo_rho = np.asarray(flow.mean_gwb - flow.half_range_gwb)
-        train_hi_rho = np.asarray(flow.mean_gwb + flow.half_range_gwb)
+        train_lo_rho, train_hi_rho = flow.log10_rho_training_range(rho_lower_fallback)
         train_lo_ast = np.asarray(flow.mean_ast - flow.half_range_ast)
         train_hi_ast = np.asarray(flow.mean_ast + flow.half_range_ast)
 
@@ -128,15 +137,22 @@ class AstroGWB(Correlated):
             raise ValueError(
                 f"the flow was trained at frequencies {np.asarray(f_conv)} (Tspan "
                 f"{flow.metadata.get('tspan')}) but the model uses {np.asarray(self.freqs)} "
-                f"(Tspan {self.tspan}); set data.pta_tspan to the flow's Tspan before building "
-                "the model, since every Fourier basis uses it")
+                f"(Tspan {self.tspan}); call set_flow_tspan(data, flow) before building the "
+                "model, since every Fourier basis uses data.pta_tspan")
 
         # ---- astrophysical parameters: varied subset and its prior box ----
         self.n_astro = int(flow.n_params)
+        names = flow.metadata.get('param_names') or [f"theta_{i}" for i in range(self.n_astro)]
         fixed_astro = dict(fixed_astro or {})
+        unknown = [k for k in fixed_astro if isinstance(k, str) and k not in names]
+        if unknown:
+            raise ValueError(f"fixed_astro names {unknown} are not flow parameters {list(names)}")
+        # name keys -> context indices
+        fixed_astro = {(names.index(k) if isinstance(k, str) else int(k)): v
+                       for k, v in fixed_astro.items()}
         container = np.zeros(self.n_astro)
         for i, v in fixed_astro.items():
-            container[int(i)] = v
+            container[i] = v
         self.astro_container = jnp.asarray(container)
         self.varied = np.array([i for i in range(self.n_astro) if i not in fixed_astro], dtype=int)
         self.n_varied = len(self.varied)
@@ -159,7 +175,6 @@ class AstroGWB(Correlated):
         self.astro_lower = jnp.asarray(lower_ast)
         self.astro_upper = jnp.asarray(upper_ast)
 
-        names = flow.metadata.get('param_names') or [f"theta_{i}" for i in range(self.n_astro)]
         self.astro_param_names = [names[i] for i in self.varied]
         self.astro_log_prior = astro_log_prior
 
@@ -181,12 +196,68 @@ class AstroGWB(Correlated):
         Returns
         ------------------------------
         log_prior : jax.Array
-        	Scalar log p_flow(log10_rho | theta) + astro_log_prior(theta_varied).
+        	Scalar log p_flow(log10_rho | theta) + astro_log_prior(theta), with
+        	theta the full context vector.
 
         '''
         # The flow's context is the full theta: fixed values with the varied ones filled in
         theta = self.astro_container.at[self.varied].set(theta_varied)
         log_prior = self.flow.log_prob(log10_rho, theta)
         if self.astro_log_prior is not None:
-            log_prior = log_prior + self.astro_log_prior(theta_varied)
+            log_prior = log_prior + self.astro_log_prior(theta)
         return log_prior
+
+
+def set_flow_tspan(data, flow, policy='flow', rtol=1e-3):
+    '''
+
+    Use the flow's training Tspan for the PTA's Fourier bases. The flow fixes
+    the GWB frequencies k/T_flow (and rho^2 = S/T_flow), so ``data.pta_tspan``
+    is set to T_flow after checking it against the data's own span, as
+    run_pandora's ``check_tspan`` does. Call it before ``make_red_noise``:
+    every Fourier basis reads ``pta_tspan``.
+
+    Arguments
+    ------------------------------
+    data : ATLAS.data.PTA_Data
+    	The PTA data; ``data.pta_tspan`` is replaced.
+    flow : FlaxAstroFlow or ZukoAstroFlow
+    	A trained flow whose metadata holds ``tspan`` [s].
+    policy : str
+    	'flow': raise if T_flow is longer than the data span (the flow's
+    	lowest bin is then not resolved by the data), warn if it is shorter.
+    	'strict': raise unless the spans agree to ``rtol``. (Default: 'flow')
+    rtol : float
+    	Relative tolerance of the comparison (1e-3 is ~6 days over 16 yr).
+    	(Default: 1e-3)
+
+    Returns
+    ------------------------------
+    tspan : float
+    	The Tspan now in ``data.pta_tspan`` [s]; the data's own if the flow
+    	records none.
+
+    '''
+    if policy not in ('flow', 'strict'):
+        raise ValueError(f"policy must be 'flow' or 'strict', got {policy!r}")
+    tspan_data = float(data.pta_tspan)
+    tspan_flow = flow.metadata.get('tspan')
+    if tspan_flow is None:
+        warnings.warn("the flow's metadata has no 'tspan'; keeping the data's Tspan", stacklevel=2)
+        return tspan_data
+    tspan_flow = float(tspan_flow)
+
+    yr = 365.25 * 86400.0
+    msg = f"data Tspan {tspan_data / yr:.4f} yr vs flow Tspan {tspan_flow / yr:.4f} yr"
+    if policy == 'strict' and abs(tspan_data - tspan_flow) / tspan_flow > rtol:
+        raise ValueError(f"Tspan mismatch ({msg}); use policy='flow' to use the flow's basis anyway")
+    if policy == 'flow':
+        if tspan_flow > tspan_data * (1 + rtol):
+            raise ValueError(f"the flow's Tspan exceeds the data's ({msg}); its lowest bin is not "
+                             "resolved by the data")
+        if tspan_flow < tspan_data * (1 - rtol):
+            warnings.warn(f"the flow's Tspan is shorter than the data's ({msg}); using the flow's "
+                          "Fourier basis", stacklevel=2)
+    log.info("Fourier bases use the flow's Tspan (%s)", msg)
+    data.pta_tspan = tspan_flow
+    return tspan_flow

@@ -203,8 +203,9 @@ def test_pulsar_module_is_the_one_that_needs_them():
 def test_core_and_astro_signal_import_without_flows():
     '''
 
-    The core, including the `astro` signal module, imports without the flow
-    libraries or holodeck: `AstroGWB` imports the flows only when one is built.
+    The core, including the `astro` signal module, the pspace priors and the
+    flow loader, imports without the flow libraries or holodeck: each imports
+    them only when used.
 
     Arguments
     ------------------------------
@@ -216,5 +217,6 @@ def test_core_and_astro_signal_import_without_flows():
 
     '''
     r = _import_with_blocked(("flax", "distrax", "optax", "torch", "zuko", "holodeck"),
-                             mods=CORE + ["ATLAS.signals.correlated.astro_gwb"])
+                             mods=CORE + ["ATLAS.signals.correlated.astro_gwb",
+                                          "ATLAS.astro.priors", "ATLAS.astro.flows"])
     assert r.returncode == 0, f"{r.stdout}\n{r.stderr[-2000:]}"

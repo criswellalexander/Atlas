@@ -136,6 +136,7 @@ def _write_library(path, tspan, dtype, n_samp=4, n_f=8, n_real=30, seed=0):
         h5.create_dataset("sample_params", data=rng.normal(size=(n_samp, 3)))
         h5.create_dataset("gwb", data=gwb.astype(dtype))
         h5.attrs["param_names"] = np.array(["a", "b", "c"]).astype("S")
+        h5.attrs["parameter_space_class_name"] = b"PS_Test"
 
 
 @pytest.mark.astro
@@ -149,6 +150,7 @@ def test_holodeck_library_matches_pandora_legacy(tmp_path, tspan, dtype):
     assert ts.param_names == names
     assert np.array_equal(ts.log10_rho, chain[..., -N_FREQS:])
     assert np.array_equal(ts.params, chain[:, 0, :-N_FREQS])
+    assert ts.metadata["param_space"] == "PS_Test"
     # tspan inferred from the library's bin width
     assert np.isclose(trainset.load_holodeck_library(path, N_FREQS).tspan, tspan, rtol=1e-12)
 
