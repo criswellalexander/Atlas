@@ -27,9 +27,10 @@ import yaml
 from ATLAS.runner import registry
 
 __all__ = ["DEFAULTS", "SIGNALS", "load_config", "expand_runs", "validate_run", "substitute_vars",
-           "ConfigError", "set_dotted", "get_dotted", "load_priors", "prior_bounds"]
+           "ConfigError", "set_dotted", "get_dotted", "load_priors", "prior_bounds",
+           "load_function"]
 
-SIGNALS = ("unc", "cor", "dm", "gtm", "chrom", "cquad", "sw", "det")
+SIGNALS = ("unc", "cor", "astro", "dm", "gtm", "chrom", "cquad", "sw", "det")
 # relative order the separate blocks must keep (partial marginalisation lays
 # the non-GWB phi out IRN | DM | GTM | extras, and det must come last)
 _BLOCK_ORDER = ("dm", "gtm", "chrom", "cquad", "sw", "det")
@@ -97,6 +98,11 @@ DEFAULTS = {
                     # {file: flow.npz, flow_num_layers: 4, hidden_size: 128,
                     #  mlp_num_layers: 2, num_bins: 8, B: 5.0, mass_samples: 200000}
                     "prior_flow": None},
+            # HD free-spectrum GWB with a hierarchical astrophysical prior: a trained
+            # p(log10_rho | theta) flow, theta sampled (ATLAS.signals.correlated.astro_gwb)
+            "astro": {"flow": None, "pickle": None, "mapping": None, "priors": None,
+                      "fixed": {}, "log_prior": None, "pspace": None,
+                      "tspan_policy": "flow", "tspan_rtol": 1e-3, "n_prior_draws": 20000},
             "dm": {"psd": "powerlaw", "fixed": {}, "priors": "dm_powerlaw", "varied_index": False},
             "chrom": {"psd": "powerlaw", "fixed": {}, "priors": "chrom_powerlaw", "chrom_index": 4.0,
                       "varied_index": False, "index_bounds": [0.0, 7.0]},
@@ -471,8 +477,8 @@ def validate_run(run, check_files=True):
         errs.append(f"sampler.kind {smp['kind']!r} is not supported yet (only 'nuts')")
     if smp["chain_method"] not in ("sequential", "vectorized", "parallel"):
         errs.append(f"sampler.chain_method must be sequential|vectorized|parallel")
-    if smp["marg_over_non_gwb"] and "cor" not in present:
-        errs.append("sampler.marg_over_non_gwb needs a 'cor' signal")
+    if smp["marg_over_non_gwb"] and "cor" not in present and "astro" not in present:
+        errs.append("sampler.marg_over_non_gwb needs a 'cor' or 'astro' signal")
     sig = m["signals"]
     if sig["dm"]["varied_index"]:
         if "dm" not in present:
@@ -491,7 +497,10 @@ def validate_run(run, check_files=True):
         if not smp["marg_over_non_gwb"]:
             errs.append("sampler.beta (thermodynamic integration) needs "
                         "sampler.marg_over_non_gwb: true (it tempers partial_marg_lnposterior)")
-        if "cor" not in present:
+        if "astro" in present:
+            errs.append("sampler.beta: TI evidence is not supported for 'astro' models yet "
+                        "(the box x flow prior on log10_rho is not normalized over the box)")
+        elif "cor" not in present:
             errs.append("sampler.beta needs a 'cor' block in basis_string")
         if run["white_noise"]["stabilize_TNT"]:
             errs.append("sampler.beta needs white_noise.stabilize_TNT: false "
@@ -640,6 +649,9 @@ def validate_run(run, check_files=True):
             errs.append("model.signals.cor.prior_flow needs a 'cor' block in the basis string")
         elif check_files and not Path(_resolve(run, pf["file"])).exists():
             errs.append(f"model.signals.cor.prior_flow.file not found: {pf['file']}")
+    if "astro" in present:
+        astro_errs, resolved["astro"] = _validate_astro(run, parsed, priors, check_files)
+        errs += astro_errs
     g = sig["gtm"]
     n_src = sum(bool(x) for x in (g["basis_file"], g["basis_pattern"], g["from_pulsar"]))
     if "gtm" in present and n_src != 1:
@@ -724,6 +736,196 @@ def validate_run(run, check_files=True):
     if errs:
         raise ConfigError(f"run {name!r} cannot run:\n" + "\n".join(f"  - {e}" for e in errs))
     return parsed, resolved
+
+
+# ng20astromethods flow directory: torch.save([flow]) plus its transform metadata
+_NG20_PICKLE, _NG20_MAPPING = "zuko_flow.pkl", "transform_data.npz"
+
+
+def _flow_info(run, a):
+    """What an astro flow's files say about it, read without flax or torch.
+
+    ``a`` is ``model.signals.astro``.  Returns ``nf_type``, ``n_params``,
+    ``n_freqs``, ``param_names``, ``param_space``, ``offset`` (an offset-mode
+    flow, sampled in y = log10(rho + c)) and ``slab_dex``, or None when the files
+    cannot tell (a Pandora pickle + mapping: the mapping alone does not
+    separate rho from theta) or are missing.
+    """
+    import numpy as np
+
+    if a["flow"] is None:
+        return None
+    flow = Path(_resolve(run, a["flow"]))
+    config, ng20 = flow / "flow_config.json", flow / _NG20_MAPPING
+    if config.exists():
+        # Atlas flax or zuko flow: the metadata sits at the top level of the config
+        c = json.loads(config.read_text())
+        n_params, n_total = int(c["n_params"]), len(c["mapping"]["mean"])
+        nf_type, names, pspace = c["nf_type"], c.get("param_names"), c.get("param_space")
+        zero, slab = c.get("zero_handling"), c.get("slab_dex", 0.0)
+    elif ng20.exists():
+        with np.load(ng20) as z:
+            n_params, n_total = len(z["ast_param_idxs"]), len(z["mean"])
+            names = [str(n) for n in z["context_param_names"]] if "context_param_names" in z.files else None
+            pspace = str(z["pspace_class"]) if "pspace_class" in z.files else None
+            zero = str(z["zero_handling"]) if "zero_handling" in z.files else None
+            # flows saved before the zero slab load with slab_dex = 0, as in validate_flow
+            slab = float(z["slab_dex"]) if "slab_dex" in z.files else 0.0
+        nf_type = "rho|theta"
+    else:
+        return None
+    return dict(nf_type=nf_type, n_params=n_params, n_freqs=n_total - n_params,
+                param_names=list(names or [f"theta_{i}" for i in range(n_params)]),
+                param_space=pspace, offset=zero == "offset", slab_dex=float(slab or 0.0))
+
+
+def _validate_astro(run, parsed, priors, check_files):
+    """Problems with an ``astro`` block, and its resolved settings for the builder.
+
+    Checks that need the flow's description (bins, parameter names) use
+    ``_flow_info`` and are skipped when it is unavailable; ``AstroGWB`` and the
+    builder check again at build time.
+    """
+    a, fb = run["model"]["signals"]["astro"], run["frequency_bins"]
+    present = parsed["shared_names"] + parsed["separate_names"]
+    errs = []
+    if "cor" in present:
+        errs.append("'cor' and 'astro' cannot be combined yet: use one common process")
+
+    # -- the flow: an Atlas or ng20 directory, or a Pandora pickle + mapping --------
+    pandora = a["mapping"] is not None
+    if pandora and a["pickle"] is None:
+        errs.append("model.signals.astro.mapping (a Pandora flow) needs model.signals.astro.pickle")
+    if pandora and a["flow"] is not None:
+        errs.append("model.signals.astro: give flow (a flow directory) or pickle + mapping "
+                    "(a Pandora flow), not both")
+    if not pandora and a["flow"] is None:
+        errs.append("an 'astro' block needs model.signals.astro.flow (a flow directory) or "
+                    "pickle + mapping (a Pandora flow)")
+    needs_torch = pandora
+    if check_files and not errs:
+        if pandora:
+            for key in ("pickle", "mapping"):
+                if not Path(_resolve(run, a[key])).exists():
+                    errs.append(f"model.signals.astro.{key} not found: {a[key]}")
+        else:
+            flow = Path(_resolve(run, a["flow"]))
+            if (flow / "flow_config.json").exists():
+                pass
+            elif (flow / _NG20_MAPPING).exists():
+                pkl = flow / (a["pickle"] or _NG20_PICKLE)
+                if not pkl.exists():
+                    errs.append(f"model.signals.astro.flow: no {pkl.name} in {a['flow']}")
+            else:
+                errs.append(f"model.signals.astro.flow {a['flow']} holds neither flow_config.json "
+                            f"(an Atlas flow) nor {_NG20_MAPPING} (an ng20astromethods flow)")
+    info = None
+    if not errs:
+        try:
+            info = _flow_info(run, a)
+        except Exception as exc:
+            errs.append(f"model.signals.astro.flow: cannot read the flow's description: {exc}")
+    if info is not None:
+        if info["nf_type"] != "rho|theta":
+            errs.append(f"model.signals.astro.flow is a {info['nf_type']!r} flow; 'astro' needs "
+                        "a 'rho|theta' flow")
+        if info["offset"] and info["slab_dex"] <= 0:
+            errs.append("model.signals.astro.flow is an offset-mode flow without a zero slab "
+                        "(slab_dex = 0), which cannot be sampled; retrain with transform.slab_dex > 0")
+        flow = Path(_resolve(run, a["flow"]))
+        if (flow / "flow_config.json").exists():
+            needs_torch = "format" not in json.loads((flow / "flow_config.json").read_text())
+        else:
+            needs_torch = True                     # an ng20 pickle
+    # flax evaluates every flow in the model; torch only loads the zuko formats
+    missing = [m for m in ("flax", "distrax") if importlib.util.find_spec(m) is None]
+    if needs_torch:
+        missing += [m for m in ("torch", "zuko") if importlib.util.find_spec(m) is None]
+    if missing:
+        errs.append(f"model.signals.astro: this flow needs {missing}, which are not installed "
+                    "(torch-backed flows can be converted once with "
+                    "FlaxAstroFlow.from_zuko(flow).save(directory))")
+    names = info["param_names"] if info else None
+
+    # -- fixed parameters and prior bounds ------------------------------------------
+    fixed = a["fixed"] or {}
+    if not isinstance(fixed, dict):
+        errs.append("model.signals.astro.fixed must be {parameter name: value}")
+        fixed = {}
+    elif names is not None and set(fixed) - set(names):
+        errs.append(f"model.signals.astro.fixed: {sorted(set(fixed) - set(names))} are not flow "
+                    f"parameters {names}")
+    rho, theta = None, {}
+    if a["priors"] is not None:
+        what = f"priors[{a['priors']}]"
+        if a["priors"] not in priors:
+            errs.append(f"model.signals.astro.priors = {a['priors']!r} is not a key of the "
+                        "priors file")
+        else:
+            theta = dict(priors[a["priors"]] or {})
+            rho = theta.pop("halflog10_rho", None)
+            pairs = [rho] if _is_pair(rho) else (list(rho) if isinstance(rho, list) else None)
+            if rho is not None and (not pairs or not all(_is_pair(p) and p[0] < p[1] for p in pairs)):
+                errs.append(f"{what}: halflog10_rho must be one [low, high] pair (every bin) or a "
+                            "list with one pair per bin")
+            elif rho is not None and not _is_pair(rho) and info is not None \
+                    and len(pairs) != info["n_freqs"]:
+                errs.append(f"{what}: {len(pairs)} halflog10_rho bounds for the flow's "
+                            f"{info['n_freqs']} bins")
+            for k, v in theta.items():
+                if names is not None and k not in names:
+                    errs.append(f"{what}: {k!r} is not a flow parameter {names}")
+                elif k in fixed:
+                    errs.append(f"{what}: {k!r} is fixed (model.signals.astro.fixed); drop its bounds")
+                elif not (_is_pair(v) and v[0] < v[1]):
+                    errs.append(f"{what}: bound for {k!r} must be [low, high] with low < high, got {v}")
+
+    # -- extra log prior on theta ------------------------------------------------------
+    lp = a["log_prior"]
+    if lp not in (None, "pspace") and not (isinstance(lp, str) and ":" in lp):
+        errs.append("model.signals.astro.log_prior must be null, pspace or path/file.py:function")
+    elif isinstance(lp, str) and ":" in lp and check_files \
+            and not Path(_resolve(run, lp.rsplit(":", 1)[0])).exists():
+        errs.append(f"model.signals.astro.log_prior file not found: {lp.rsplit(':', 1)[0]}")
+    # a Pandora pickle never records its space; an unreadable flow is checked at build time
+    if lp == "pspace" and a["pspace"] is None and \
+            (pandora or (info is not None and not info["param_space"])):
+        errs.append("model.signals.astro.log_prior: pspace needs model.signals.astro.pspace "
+                    "(a holodeck parameter-space name) or a flow that records param_space")
+    if a["pspace"] is not None and lp != "pspace":
+        errs.append("model.signals.astro.pspace is only used with log_prior: pspace")
+
+    # -- Fourier basis -------------------------------------------------------------------
+    if a["tspan_policy"] not in ("flow", "strict"):
+        errs.append("model.signals.astro.tspan_policy must be flow or strict")
+    if not isinstance(a["tspan_rtol"], (int, float)) or isinstance(a["tspan_rtol"], bool) \
+            or a["tspan_rtol"] <= 0:
+        errs.append("model.signals.astro.tspan_rtol must be a positive number")
+    n = a["n_prior_draws"]
+    if not isinstance(n, int) or isinstance(n, bool) or n < 0:
+        errs.append("model.signals.astro.n_prior_draws must be an integer >= 0 (0 skips the "
+                    "flow-prior spectrum in summary.json)")
+    if fb["gwb_user_freqs"] is not None:
+        errs.append("frequency_bins.gwb_user_freqs cannot be used with 'astro': the flow fixes "
+                    "the GWB frequencies")
+    if info is not None and parsed["representative"] == "unc" and "astro" in parsed["shared_names"] \
+            and isinstance(fb["num_irn_bins"], int) and info["n_freqs"] > fb["num_irn_bins"]:
+        errs.append(f"with 'unc+astro->unc' the flow's {info['n_freqs']} GWB bins sit inside the "
+                    f"IRN basis: frequency_bins.num_irn_bins must be >= {info['n_freqs']}")
+
+    return errs, dict(rho=rho, theta=theta, fixed=dict(fixed), log_prior=lp)
+
+
+def load_function(run, spec):
+    """``'path/to/file.py:function'`` (path relative to the config file) -> the function."""
+    f, fn = spec.rsplit(":", 1)
+    path = _resolve(run, f)
+    module_spec = importlib.util.spec_from_file_location(f"atlas_custom_{abs(hash(path))}", path)
+    mod = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(mod)
+    if not hasattr(mod, fn):
+        raise AttributeError(f"{path} has no function {fn!r}")
+    return getattr(mod, fn)
 
 
 def netcdf_engine():

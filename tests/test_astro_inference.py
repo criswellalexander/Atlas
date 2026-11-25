@@ -1,4 +1,4 @@
-"""Hierarchical astro inference (astro.HDAstroRedModel / AstroInferenceModel) against Pandora.
+"""Hierarchical astro inference (inference.HDAstroRedModel / AstroInferenceModel) against Pandora.
 
 Atlas builds TNT/TNr and phi itself; the comparisons feed the same dense
 TNT/TNr into Pandora's ``models.UniformPrior`` (``utils.hd_spectrum``) and
@@ -26,8 +26,8 @@ from pandora import models, nf_dist, utils as putils  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
 
 from ATLAS.data import PTA_Data  # noqa: E402
-from ATLAS.experimental import astro  # noqa: E402
-from ATLAS.experimental import zuko_flows as zf  # noqa: E402
+from ATLAS.astro import inference  # noqa: E402
+from ATLAS.astro.flows import zuko as zf  # noqa: E402
 from tests.harness import fixture_available, load_psrs, white_noise_vector  # noqa: E402
 
 pytestmark = pytest.mark.astro
@@ -42,7 +42,7 @@ def _red(fixture, npsr=5):
     ecorr = fixture == "synth"      # the MDC fixtures have one TOA per epoch
     data = PTA_Data(psrs, num_gwb_bins=N_BINS, num_irn_bins=N_BINS, linear_timing=False,
                     marg_timing=True)
-    red = astro.HDAstroRedModel.from_pta_data(data, white_noise_vector(psrs, ecorr),
+    red = inference.HDAstroRedModel.from_pta_data(data, white_noise_vector(psrs, ecorr),
                                               include_ecorr=ecorr)
     return red, np.array([p.pos for p in psrs])
 
@@ -99,22 +99,22 @@ def _pandora(red, pos, flow=None, n_astro=N_ASTRO, fixed=None, stabilize=False, 
 
 def test_order_helpers_roundtrip():
     x = np.arange(10.0)
-    y = astro.pandora_to_atlas_order(x, 3)
+    y = inference.pandora_to_atlas_order(x, 3)
     assert list(y[:6]) == [1, 0, 3, 2, 5, 4] and list(y[6:]) == [6, 7, 8, 9]
-    assert np.array_equal(astro.atlas_to_pandora_order(y, 3), x)
+    assert np.array_equal(inference.atlas_to_pandora_order(y, 3), x)
 
 
 def test_red_likelihood_matches_pandora(red_and_pos):
     red, pos = red_and_pos
     pm = _pandora(red, pos)
     assert red.param_names[0].endswith("irn_log10_A") and red.gwb_slice == slice(10, 15)
-    assert np.array_equal(astro.atlas_to_pandora_order(red.lower, len(pos)),
+    assert np.array_equal(inference.atlas_to_pandora_order(red.lower, len(pos)),
                           np.asarray(pm.run_type_object.lower_prior_lim_all))
     rng = np.random.default_rng(0)
     for _ in range(200):
         xa = rng.uniform(red.lower, red.upper)
         la, psd_a = red.lnlikelihood(xa)
-        lp, psd_p = pm.get_lnliklihood_non_astro(jnp.asarray(astro.atlas_to_pandora_order(xa, len(pos))))
+        lp, psd_p = pm.get_lnliklihood_non_astro(jnp.asarray(inference.atlas_to_pandora_order(xa, len(pos))))
         assert np.array_equal(np.asarray(psd_a), np.asarray(psd_p))
         assert np.isclose(float(la), float(lp), rtol=1e-12, atol=0)
 
@@ -124,7 +124,7 @@ def test_phi_inverse_matches_pandora(red_and_pos):
     run = _pandora(red, pos).run_type_object
     xa = np.random.default_rng(1).uniform(red.lower, red.upper)
     phi_a = red.model.get_phi_mat(jnp.asarray(xa))
-    phi_p = run.get_phi_mat(jnp.asarray(astro.atlas_to_pandora_order(xa, len(pos))))
+    phi_p = run.get_phi_mat(jnp.asarray(inference.atlas_to_pandora_order(xa, len(pos))))
     assert np.allclose(phi_a, phi_p, rtol=1e-13, atol=0)
     inv_a, ld_a = red.model.get_phi_mat_inv(phi_a)
     inv_p, ld_p = run.get_phi_mat_inv(phi_p)
@@ -149,14 +149,14 @@ def test_from_matrices_on_pandora_15yr(stabilize):
         TNT, TNr = d["TNT"], d["TNr"]
     pos = np.load(os.path.join(PANDORA_DATA, "15yr_pulsar_positions.npy"))
     T = float(np.load(os.path.join(PANDORA_DATA, "15yr_Tspan.npy")))
-    red = astro.HDAstroRedModel.from_matrices(TNT, TNr, pos, T, N_BINS,
+    red = inference.HDAstroRedModel.from_matrices(TNT, TNr, pos, T, N_BINS,
                                               stabilize_delta=stabilize)
     pm = _pandora(red, pos, TNT=TNT, TNr=TNr, stabilize=bool(stabilize))
     rng = np.random.default_rng(2)
     for _ in range(20):
         xa = rng.uniform(red.lower, red.upper)
         la, _ = red.lnlikelihood(xa)
-        lp, _ = pm.get_lnliklihood_non_astro(jnp.asarray(astro.atlas_to_pandora_order(xa, len(pos))))
+        lp, _ = pm.get_lnliklihood_non_astro(jnp.asarray(inference.atlas_to_pandora_order(xa, len(pos))))
         assert np.isclose(float(la), float(lp), rtol=1e-11, atol=0)
 
 
@@ -166,13 +166,13 @@ def test_from_matrices_on_pandora_15yr(stabilize):
 def test_astro_likelihood_matches_pandora(red_and_pos, fixed):
     red, pos = red_and_pos
     flow = _flow(red)
-    ours = astro.AstroInferenceModel(red, flow, -np.ones(N_ASTRO), np.ones(N_ASTRO),
+    ours = inference.AstroInferenceModel(red, flow, -np.ones(N_ASTRO), np.ones(N_ASTRO),
                                      fixed_astro=fixed)
     pm = _pandora(red, pos, flow, fixed=fixed)
     rng = np.random.default_rng(3)
     for _ in range(50):
         xa = rng.uniform(ours.lower, ours.upper)
-        xp = astro.atlas_to_pandora_order(xa, len(pos))
+        xp = inference.atlas_to_pandora_order(xa, len(pos))
         assert np.isclose(ours.lnlikelihood(xa) - flow.log_jacobian(), pm.get_lnliklihood(xp),
                           rtol=1e-12, atol=1e-9)
         assert np.isfinite(ours.lnprior(xa)) == np.isfinite(pm.get_lnprior(xp))
@@ -183,7 +183,7 @@ def test_astro_likelihood_matches_pandora(red_and_pos, fixed):
 def test_gwb_flow_draw_matches_pandora(red_and_pos):
     red, pos = red_and_pos
     flow = _flow(red)
-    ours = astro.AstroInferenceModel(red, flow, -np.ones(N_ASTRO), np.ones(N_ASTRO))
+    ours = inference.AstroInferenceModel(red, flow, -np.ones(N_ASTRO), np.ones(N_ASTRO))
     pm = _pandora(red, pos, flow)
     x = ours.make_initial_guess(seed=5)
     q, lqxy = ours._gwb_flow_draw(x, torch_seed=7)
@@ -198,7 +198,7 @@ def test_gwb_flow_draw_matches_pandora(red_and_pos):
 def test_gwb_flow_draw_uses_full_theta_when_fixed(red_and_pos):
     red, _ = red_and_pos
     flow = _flow(red)
-    ours = astro.AstroInferenceModel(red, flow, -np.ones(1), np.ones(1), fixed_astro={0: 0.3})
+    ours = inference.AstroInferenceModel(red, flow, -np.ones(1), np.ones(1), fixed_astro={0: 0.3})
     x = ours.make_initial_guess(seed=6)
     q, _ = ours._gwb_flow_draw(x, torch_seed=8)
     expected = flow.sample(1, np.array([0.3, x[-1]]), seed=8)[0]
@@ -207,7 +207,7 @@ def test_gwb_flow_draw_uses_full_theta_when_fixed(red_and_pos):
 
 def test_prior_proposals_touch_one_parameter_in_their_block(red_and_pos):
     red, _ = red_and_pos
-    ours = astro.AstroInferenceModel(red, _flow(red), -np.ones(N_ASTRO), np.ones(N_ASTRO), seed=1)
+    ours = inference.AstroInferenceModel(red, _flow(red), -np.ones(N_ASTRO), np.ones(N_ASTRO), seed=1)
     x = ours.make_initial_guess()
     blocks = {ours.draw_from_prior: (0, len(x)),
               ours.draw_from_red_prior: (0, red.n_irn_params),
@@ -223,7 +223,7 @@ def test_prior_proposals_touch_one_parameter_in_their_block(red_and_pos):
 
 def test_initial_guess_seed_zero_is_honoured(red_and_pos):
     red, _ = red_and_pos
-    ours = astro.AstroInferenceModel(red, _flow(red), -np.ones(N_ASTRO), np.ones(N_ASTRO))
+    ours = inference.AstroInferenceModel(red, _flow(red), -np.ones(N_ASTRO), np.ones(N_ASTRO))
     assert np.array_equal(ours.make_initial_guess(seed=0), ours.make_initial_guess(seed=0))
 
 
@@ -232,12 +232,12 @@ def test_flow_frequency_mismatch_raises(red_and_pos):
     flow = _flow(red)
     flow.metadata["f_conv"] = list(red.f_common * 1.01)
     with pytest.raises(ValueError, match="Tspan"):
-        astro.AstroInferenceModel(red, flow, -np.ones(N_ASTRO), np.ones(N_ASTRO))
+        inference.AstroInferenceModel(red, flow, -np.ones(N_ASTRO), np.ones(N_ASTRO))
     torch.manual_seed(0)
     short = zf.ZukoAstroFlow(zf.make_zuko_flow(3, N_ASTRO, hidden_features=[8]), "rho|theta",
                              dict(B=5, mean=np.zeros(5), half_range=np.ones(5)), N_ASTRO)
     with pytest.raises(ValueError, match="frequency bins"):
-        astro.AstroInferenceModel(red, short, -np.ones(N_ASTRO), np.ones(N_ASTRO))
+        inference.AstroInferenceModel(red, short, -np.ones(N_ASTRO), np.ones(N_ASTRO))
 
 
 def test_flow_draw_only_for_free_spectrum():
@@ -246,7 +246,7 @@ def test_flow_draw_only_for_free_spectrum():
     psrs = load_psrs("synth", 3)
     data = PTA_Data(psrs, num_gwb_bins=N_BINS, num_irn_bins=N_BINS, linear_timing=False,
                     marg_timing=True)
-    red = astro.HDAstroRedModel.from_pta_data(
+    red = inference.HDAstroRedModel.from_pta_data(
         data, white_noise_vector(psrs, True), include_ecorr=True, gwb_psd_function=powerlaw,
         gwb_bounds=(np.array([-18.0, 0.0]), np.array([-11.0, 7.0])))
     assert not red.gwb_is_free_spectrum and red.gwb_slice == slice(6, 8)
@@ -260,7 +260,7 @@ def _chain(path):
 
 def test_seeded_chains_are_reproducible(tmp_path):
     red, _ = _red("synth", 3)
-    ours = astro.AstroInferenceModel(red, _flow(red), -np.ones(N_ASTRO), np.ones(N_ASTRO))
+    ours = inference.AstroInferenceModel(red, _flow(red), -np.ones(N_ASTRO), np.ones(N_ASTRO))
     kw = dict(seed=11, resume=False, isave=100, thin=1)
     ours.sample(600, str(tmp_path / "a"), **kw)
     ours.sample(600, str(tmp_path / "b"), **kw)
@@ -280,16 +280,16 @@ def test_posterior_agrees_with_pandora(tmp_path):
     """Both samplers on the same 3-pulsar posterior; marginals agree within MC error."""
     red, pos = _red("synth", 3)
     flow = _flow(red, seed=3)
-    ours = astro.AstroInferenceModel(red, flow, -np.ones(N_ASTRO), np.ones(N_ASTRO))
+    ours = inference.AstroInferenceModel(red, flow, -np.ones(N_ASTRO), np.ones(N_ASTRO))
     pm = _pandora(red, pos, flow)
     niter = 40_000
     x0 = ours.make_initial_guess(seed=1)
     ours.sample(niter, str(tmp_path / "atlas"), x0=x0, seed=2, resume=False, thin=10)
-    pm.sample(astro.atlas_to_pandora_order(x0, len(pos)), niter, str(tmp_path / "pandora"),
+    pm.sample(inference.atlas_to_pandora_order(x0, len(pos)), niter, str(tmp_path / "pandora"),
               resume=False)
     ndim = len(x0)
     a = _chain(tmp_path / "atlas")[:, :ndim]
-    p = astro.pandora_to_atlas_order(_chain(tmp_path / "pandora")[:, :ndim], len(pos))
+    p = inference.pandora_to_atlas_order(_chain(tmp_path / "pandora")[:, :ndim], len(pos))
     a, p = a[len(a) // 4:], p[len(p) // 4:]
     for j in list(range(red.gwb_slice.start, ndim)):
         se = np.hypot(_batch_se(a[:, j]), _batch_se(p[:, j]))

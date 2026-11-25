@@ -15,8 +15,9 @@ the Gaussian ``-0.5 g^T phi_G^-1 g`` prior term inside
 
 ``inverse_wishart.py`` is an alternative prior on the cross-pulsar covariance.
 
-``astro.py`` is the port of Pandora's hierarchical astrophysical inference
-(holodeck training sets so far; needs the ``astro`` extra).
+The port of Pandora's hierarchical astrophysical inference (training sets,
+flows and the hierarchical model) used to be parked here; it now lives in
+``ATLAS/astro/``.
 
 Nothing here is imported by the sampling path, and nothing here should be.
 """

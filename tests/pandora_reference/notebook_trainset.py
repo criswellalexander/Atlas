@@ -13,7 +13,7 @@ changes needed to call them from a test:
 * ``examples/NormalizingFlowTrainDEMO.ipynb`` cells 5, 10, 12, 14 and 16:
   the library path, the number of bins and ``Tspan`` became arguments.
 
-Nothing else is changed, so any difference from ATLAS.experimental.astro is a
+Nothing else is changed, so any difference from ATLAS.astro.flows.trainset is a
 difference from Pandora.
 """
 import glob

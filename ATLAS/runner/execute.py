@@ -189,16 +189,8 @@ def _custom_model(run, b):
     """``sampler.model: path/to/file.py:function`` -> ``function(run, built)``,
     which returns ``(model, kwargs)`` for ``MCMC.run``.  The run's variables
     are in ``run['vars']``."""
-    import importlib.util
-    from ATLAS.runner.config import resolve_path
-    f, fn = run["sampler"]["model"].rsplit(":", 1)
-    path = resolve_path(run, f)
-    spec = importlib.util.spec_from_file_location(f"atlas_custom_{abs(hash(path))}", path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    if not hasattr(mod, fn):
-        raise AttributeError(f"{path} has no function {fn!r}")
-    model, args = getattr(mod, fn)(run, b)
+    from ATLAS.runner.config import load_function
+    model, args = load_function(run, run["sampler"]["model"])(run, b)
     return model, dict(args or {})
 
 
@@ -209,7 +201,36 @@ def _named(samples, b):
     for site in ("chrom_gp_index", "chromatic_index"):
         if site in samples:
             names[site] = [f"{n}_{site}" for n in b.psr_names]
+    if getattr(b.rn, "has_astro", False):
+        names["astro_params"] = list(b.rn.astro_signal.astro_param_names)
     return names
+
+
+def _astro_spectrum(run, b, samples, out_dir):
+    """run_pandora's GWB spectrum outputs for an astro run.
+
+    Writes ``gwb_log10_rho.npy`` ((chains x draws, F) log10 rho, NaN where
+    rho = 0) and returns the ``p_rho_zero`` / ``gwb_log10_rho`` summary blocks,
+    with the flow prior's when a parameter space is known and
+    ``model.signals.astro.n_prior_draws`` > 0.
+    """
+    from ATLAS.astro.utils import flow_prior_log10_rho, gwb_log10_rho, spectrum_summary
+    sig, a = b.rn.astro_signal, run["model"]["signals"]["astro"]
+    red = np.asarray(samples["red_noise"])
+    post = gwb_log10_rho(red[..., b.rn.common_param_slice].reshape(-1, sig.flow.n_freqs), sig.flow)
+    np.save(out_dir / "gwb_log10_rho.npy", post)
+
+    prior = None
+    pspace = a["pspace"] or sig.flow.metadata.get("param_space")
+    if a["n_prior_draws"] and pspace is not None:
+        try:
+            prior = flow_prior_log10_rho(sig.flow, pspace, sig.context_names, sig.astro_container,
+                                         sig.varied, np.asarray(sig.astro_lower),
+                                         np.asarray(sig.astro_upper), a["n_prior_draws"],
+                                         int(run["sampler"]["seed"]))
+        except ImportError as exc:
+            log.warning("flow-prior spectrum skipped: %s", exc)
+    return spectrum_summary(post, prior)
 
 
 def _save(run, samples, names, diverging):
@@ -343,6 +364,8 @@ def run_one(run, prebuilt=None):
         names = _named(samples, b)
         path = _save(run, samples, names, diverging) if run["output"]["save"]["samples"] else None
         summ = _summary(samples, names, diverging, beta=smp["beta"])
+        if getattr(b.rn, "has_astro", False) and "red_noise" in samples:
+            summ.update(_astro_spectrum(run, b, samples, out_dir))
         (out_dir / "summary.json").write_text(json.dumps(summ, indent=2))
         st = dict(state="done", output=str(path) if path else None,
                   num_divergent=summ["num_divergent"],

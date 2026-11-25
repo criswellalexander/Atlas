@@ -1,0 +1,9 @@
+# Prior bounds (uniform [low, high]) for astro_pandora_style.yaml.
+
+irn_pandora:              # Pandora's intrinsic red-noise box (run_pandora pta.irn_*)
+  log10_A: [-18.0, -11.0]
+  gamma:   [1.0, 7.0]
+
+astro_gwb:                # every entry optional; left out = the flow's training range
+  # halflog10_rho: [-9.0, -5.0]          # one pair (every bin) or one pair per flow bin
+  # hard_outer_time: [0.1, 11.0]         # a theta parameter, by its flow name

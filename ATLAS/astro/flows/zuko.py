@@ -4,10 +4,10 @@ Conditional normalizing flows for astrophysical GWB inference, on zuko (torch).
 This is the port of Pandora's ``nf_dist.py``. The flows are zuko neural
 spline flows (``zuko.flows.spline.NSF`` with coupling transforms,
 ``passes=2``), trained on the normalized training sets from
-:mod:`ATLAS.experimental.astro`:
+:mod:`ATLAS.astro.flows.trainset`:
 
 * :func:`make_zuko_flow` builds the flow Pandora builds.
-* :class:`~ATLAS.experimental.flow_utils.BatchSampler` (re-exported here)
+* :class:`~ATLAS.astro.flows.utils.BatchSampler` (re-exported here)
   draws training batches the way Pandora does: ``'diagonal'`` and ``'mesh'``
   (``NFMaker.sample_from_dist``) or ``'flat'`` (the training loop in
   ``AstroInferenceUpdated.ipynb``).
@@ -18,7 +18,7 @@ spline flows (``zuko.flows.spline.NSF`` with coupling transforms,
   trained flow in physical units.
 
 Given the same seeds, training reproduces Pandora's weights bit for bit.
-Stage 2 of the port reimplements these flows in flax (``flax_flows.py``).
+``ATLAS.astro.flows.flax`` reimplements these flows in JAX.
 
 Differences from Pandora
 ------------------------
@@ -53,7 +53,7 @@ import torch
 import zuko
 from tqdm.auto import trange
 
-from ATLAS.experimental.flow_utils import (
+from ATLAS.astro.flows.utils import (
     NF_TYPES,
     BatchSampler,
     HellingerMonitor,
@@ -326,13 +326,16 @@ class ZukoAstroFlow:
         reverse. ``'rho'``: unconditional density of ``log10_rho``.
     mapping : dict
         ``B``, ``mean``, ``half_range`` from
-        :meth:`ATLAS.experimental.astro.TrainingSet.normalization`: arrays of
+        :meth:`ATLAS.astro.flows.trainset.TrainingSet.normalization`: arrays of
         length ``n_params + n_freqs``, astrophysical parameters first.
     n_params : int
         Number of astrophysical parameters.
     device : str, optional
     metadata : dict, optional
         Kept in the saved config (``param_names``, ``f_conv``, ``tspan``, ...).
+        An offset-mode flow (``zero_handling='offset'``, ng20astromethods)
+        models ``y = log10(rho + rho_offset)``; it is evaluated and sampled in
+        that variable, which ``AstroGWB`` samples directly.
     """
 
     def __init__(self, flow, nf_type, mapping, n_params, device="cpu", metadata=None):
@@ -484,8 +487,13 @@ class ZukoAstroFlow:
             from ``AstroInferenceUpdated.ipynb``. Unpickling runs code from
             the file, so only load files you trust.
         mapping_path : str
-            Pandora's ``*_mapping_data.npy.npz`` (``B``, ``mean``, ``half_range``).
+            Pandora's ``*_mapping_data.npy.npz`` (``B``, ``mean``, ``half_range``),
+            or ng20astromethods' ``transform_data.npz``, whose description of
+            the flow (context names, ``fobs``, ``tspan``, ``pspace_class``,
+            zero handling and zero slab) becomes the metadata.
         nf_type : str
+        metadata : dict, optional
+            Overrides the metadata read from the mapping file.
 
         The flow is rebuilt from its inferred architecture and the pickled
         weights, so it can be re-saved with :meth:`save`.
@@ -494,6 +502,15 @@ class ZukoAstroFlow:
         pickled = obj[0] if isinstance(obj, (list, tuple)) else obj
         with np.load(mapping_path) as m:
             mapping = dict(B=m["B"][()], mean=m["mean"], half_range=m["half_range"])
+            found = {_NG20_KEYS[k]: (m[k].item() if m[k].ndim == 0 else m[k].tolist())
+                     for k in m.files if k in _NG20_KEYS}
+            if "ast_param_idxs" in m.files:
+                # Atlas keeps the astrophysical parameters first, as ng20 writes them
+                ast, rho = m["ast_param_idxs"], m["rho_idxs"]
+                if not (np.array_equal(ast, np.arange(len(ast)))
+                        and np.array_equal(rho, np.arange(len(ast), len(ast) + len(rho)))):
+                    raise ValueError(f"{mapping_path}: expected the context parameters first, "
+                                     f"got ast_param_idxs={ast} and rho_idxs={rho}")
         if isinstance(obj, (list, tuple)) and len(obj) > 1 and obj[1] != mapping["B"]:
             raise ValueError(f"pickle has B={obj[1]} but the mapping has B={mapping['B']}")
         arch = _flow_architecture(pickled)
@@ -502,7 +519,14 @@ class ZukoAstroFlow:
         n_total = len(mapping["mean"])
         n_params = arch["n_features"] if nf_type == "theta|rho" else n_total - arch["n_features"]
         return cls(flow, nf_type, mapping, n_params, device=device,
-                   metadata=dict(metadata or {}, source=os.path.abspath(pickle_path)))
+                   metadata=dict(found, **(metadata or {}), source=os.path.abspath(pickle_path)))
+
+
+# ng20astromethods' transform_data.npz key -> Atlas metadata key
+_NG20_KEYS = dict(context_param_names="param_names", fobs="f_conv", tspan="tspan",
+                  pspace_class="param_space", zero_handling="zero_handling",
+                  rho_offset="rho_offset", slab_dex="slab_dex", slab_shape="slab_shape",
+                  marginalized_param_names="marginalized_param_names")
 
 
 def _jsonable(obj):

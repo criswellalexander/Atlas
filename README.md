@@ -232,8 +232,10 @@ Signals are declared with a compact string passed to `make_red_noise`:
 ```
 
 Recognised names are `unc` (intrinsic red noise), `cor` (correlated background),
-`dm` (dispersion measure), `gtm` (Adaptus timing basis) and `det`
-(deterministic).
+`astro` (correlated background with an astrophysical population prior; see
+below), `dm` (dispersion measure), `gtm` (Adaptus timing basis) and `det`
+(deterministic). `astro` takes the place of `cor`; the two cannot yet be
+combined.
 
 No name is mandatory, `cor` included. A single-pulsar noise run wants a model
 with no correlated process at all — a common process cannot be separated from
@@ -281,6 +283,65 @@ curvature instead of an unbounded flat direction.
 This layout is hardcoded around the five signal names above. Adding a sixth
 requires edits in both `parameterized.py` classes as well as
 `signals/factorized/base.py`; replacing it with a component registry is planned.
+
+### Astrophysical GWB prior
+
+An `astro` block is a Hellings-Downs free-spectrum background whose amplitudes
+carry a hierarchical prior from a trained normalizing flow p(log10 rho | theta)
+(the Pandora approach). The astrophysical parameters theta are sampled with
+everything else. It needs the `[astro]` extra and a `'rho|theta'` flow, e.g. one
+trained with `ATLAS.astro.flows.train.train_astro_flow`:
+
+```python
+from ATLAS.astro.flows import load_astro_flow
+from ATLAS.astro.priors import pspace_log_prior
+from ATLAS.signals.correlated.astro_gwb import set_flow_tspan
+
+flow = load_astro_flow("my_flow/")          # Atlas, ng20astromethods or Pandora flow
+set_flow_tspan(data, flow)                  # the flow fixes the GWB frequencies
+rn = ModelBuilder(data=data).make_red_noise(
+    "ltm|unc+astro->unc", irn_psd_function=powerlaw,
+    irn_lower_bound_psd=..., irn_upper_bound_psd=...,
+    astro_flow=flow,
+    astro_log_prior=pspace_log_prior(flow.metadata["param_space"],
+                                     flow.metadata["param_names"]),
+    fixed_astro={"mmb_zplaw_amp": 0.0})
+mcmc.run(..., super_sig=rn, marg_over_non_gwb=True)
+```
+
+- `load_astro_flow` reads a directory saved by `FlaxAstroFlow.save` or
+  `ZukoAstroFlow.save`, an ng20astromethods directory (`zuko_flow.pkl` +
+  `transform_data.npz`, whose metadata it keeps), or a Pandora pickle and
+  mapping (`pickle=..., mapping=...`). All but flax need torch; pickles run
+  code when loaded, so only load trusted files.
+- Flows trained with `zero_handling='offset'` (on y = log10(rho + c), ng20astromethods)
+  are sampled in y, as `run_pandora` does: the box starts at the bottom of the zero slab
+  (log10 c − `slab_dex`), a bin in the slab has rho = 0 (no GWB power), so the flow's slab
+  mass is P(rho = 0 | theta), and the parameters are `astro_log10_rho_plus_c_i`. Only the
+  upper `gwb_upper_bound_psd` (log10 rho, mapped to y) applies; `slab_dex` = 0 raises.
+  `ATLAS.astro.utils.gwb_log10_rho` maps samples back to log10 rho (NaN where rho = 0).
+- The number of background bins is the flow's. `set_flow_tspan` sets
+  `data.pta_tspan` to the flow's training span, which every Fourier basis
+  uses, so call it before building the model. It warns if the flow's span is
+  shorter than the data's and raises if it is longer (`policy='strict'`
+  raises on any mismatch beyond `rtol`). A frequency mismatch raises.
+- By default, the uniform boxes on log10 rho (`gwb_lower/upper_bound_psd`) and
+  on theta (`astro_lower/upper_bound`) are the flow's training ranges.
+- `fixed_astro={index or name: value}` holds parameters fixed, and
+  `astro_log_prior` adds a JAX-traceable prior, called with the full theta in
+  the flow's context order. `pspace_log_prior` is the holodeck parameter-space
+  prior (uniform, normal, multivariate normal and 2D hardening terms, as in
+  run_pandora); a parameter space Atlas trained on is recorded in the flow's
+  `param_space`.
+- `model_maker` adds the site `astro_params` and the factor `astro_hyperprior`;
+  with `MultiHMCGibbs`, put `astro_params` in one of the groups.
+- The rho parameters are named `astro_halflog10_rho_i` (`astro_log10_rho_plus_c_i` for
+  offset-mode flows).
+- `atlas-run` configs take the same model through `model.signals.astro` (see
+  `ATLAS/runner/templates/run_config.yaml`); `ATLAS/runner/examples/astro/` is the
+  YAML form of a Pandora-style (`run_pandora`) analysis. Astro runs also write
+  `gwb_log10_rho.npy` and the `p_rho_zero` / `gwb_log10_rho` blocks of `summary.json`, as
+  `run_pandora` does.
 
 ## Timing model
 

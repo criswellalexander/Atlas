@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Haiku (experimental/flows.py) vs Flax NNX (experimental/flax_flows.py).
+"""Haiku (experimental/flows.py) vs Flax NNX (astro/flows/flax.py).
 
     python bench/bench_flows.py                   # astro.py-sized CW flow
     python bench/bench_flows.py --preset toy      # D=4, C=2: per-call overhead
@@ -24,7 +24,7 @@ Sections:
   parity          max |Δ log_prob| after copying Haiku weights into NNX
 
 Rows marked "nnx.jit design" time the first NNX design (nnx.jit, module
-mutated in place) on the same operations, to show why flax_flows.py uses a
+mutated in place) on the same operations, to show why astro/flows/flax.py uses a
 plain jax.jit over the module as a pytree instead.
 
 Caveats the numbers need:
@@ -60,7 +60,7 @@ import optax
 from flax import nnx
 
 from ATLAS.experimental import flows as hkf
-from ATLAS.experimental import flax_flows as ff
+from ATLAS.astro.flows import flax as ff
 from bench.harness import (Timing, compiled_memory, fmt_bytes, machine,
                            timeit, write_results)
 

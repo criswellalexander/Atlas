@@ -39,6 +39,11 @@ cw:                                # in the argument order of cw_delay_evolve_fl
   phi:        [0.0, 6.283185307179586]
   phase0:     [0.0, 6.283185307179586]
 
+astro_gwb:                         # model.signals.astro.priors; every entry is optional
+  halflog10_rho: [-12.0, -4.0]     # log10 rho; one pair (every bin) or one pair per flow bin;
+                                   #   offset-mode flows use only the upper edges
+  # gsmf_phi0_log10: [-3.5, -1.5]  # bounds on a theta parameter, by its flow name
+
 # White-noise bounds default to ATLAS's WhiteCov values; uncomment to override.
 # white_noise:
 #   efac:        [0.1, 10.0]

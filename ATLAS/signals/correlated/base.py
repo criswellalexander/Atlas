@@ -69,6 +69,9 @@ class Correlated:
         The log-determinant of the overlap reduction function matrix.
     """
 
+    # Prefix of this signal's parameter names in the phi model, e.g. gwb_log10_A
+    param_prefix = 'gwb'
+
     def __init__(self,
                  data,
                  name,

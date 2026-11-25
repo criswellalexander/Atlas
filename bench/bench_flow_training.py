@@ -27,7 +27,7 @@ import numpy as np
 import jax
 
 from bench.harness import machine, timeit, write_results
-from ATLAS.experimental import flax_flows as ff
+from ATLAS.astro.flows import flax as ff
 
 ARCHITECTURES = {
     "zuko_nsf": dict(bins=8, hidden_features=[512, 512], transforms=3),

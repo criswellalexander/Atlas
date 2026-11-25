@@ -151,7 +151,13 @@ class ModelBuilder:
                        cquad_project_timing=True,
                        # ---- time-domain solar wind (`sw`) ----
                        sw_geometry=None,
-                       sw_kwargs=None):
+                       sw_kwargs=None,
+                       # ---- astrophysical GWB (`astro`) ----
+                       astro_flow=None,
+                       astro_lower_bound=None,
+                       astro_upper_bound=None,
+                       astro_log_prior=None,
+                       fixed_astro=None):
         """Assemble and return a ``SuperSignal`` from named components.
 
         Which components are built is determined entirely by the names that
@@ -167,6 +173,14 @@ class ModelBuilder:
         ``'cor'``
             Common correlated process (``Correlated``).  Requires
             ``gwb_psd_function``, ``orf_function`` and their bound arrays.
+        ``'astro'``
+            Hellings-Downs free-spectrum GWB with a hierarchical astrophysical
+            prior (``AstroGWB``): a trained ``'rho|theta'`` flow
+            (``astro_flow``) is the prior on the amplitudes, and its
+            astrophysical parameters are sampled (``model_maker`` site
+            ``'astro_params'``).  The bins are the flow's, so
+            ``data.pta_tspan`` must equal the flow's Tspan.  Takes the place
+            of ``'cor'``; the two cannot be combined yet.
         ``'dm'``
             DM noise (``Red`` with ``name='dm'``).  Requires
             ``dm_psd_function`` and its bound arrays.
@@ -228,7 +242,8 @@ class ModelBuilder:
         dm_lower_bound_psd, dm_upper_bound_psd : array, optional
             As above for DM noise.
         gwb_lower_bound_psd, gwb_upper_bound_psd : array, optional
-            As above for the GWB PSD.
+            As above for the GWB PSD.  For ``'astro'``, bounds on each bin's
+            ``halflog10_rho``; None uses the flow's training range.
         upper_bound_orf, lower_bound_orf : array, optional
             Prior bounds for the ORF's free parameters.
         det_parameter_bounds : array, optional
@@ -243,6 +258,19 @@ class ModelBuilder:
             per basis column per pulsar, uniform in these bounds (a scalar or
             one value per column).  Give both or neither; not together with
             ``gt_psd_val``.
+        astro_flow : FlaxAstroFlow or ZukoAstroFlow, optional
+            Trained ``'rho|theta'`` flow (e.g. from
+            ``ATLAS.astro.flows.load_astro_flow``); required for ``'astro'``.
+            A zuko flow is converted to flax.
+        astro_lower_bound, astro_upper_bound : array, optional
+            Uniform prior bounds of the varied astrophysical parameters; None
+            uses the flow's training range.
+        astro_log_prior : callable, optional
+            Extra JAX-traceable log prior on the astrophysical parameters,
+            called with the full theta in the flow's context order, e.g.
+            ``ATLAS.astro.priors.pspace_log_prior``.
+        fixed_astro : dict, optional
+            ``{index or name: value}`` of astrophysical parameters held fixed.
 
         Returns
         -------
@@ -298,6 +326,26 @@ class ModelBuilder:
                 lower_bound_orf=lower_bound_orf,
                 user_freqs = gwb_user_freqs,
                 data=self.data,
+            ))
+
+        if 'astro' in red_signal_names:
+            if 'cor' in red_signal_names:
+                raise ValueError(
+                    "'cor' and 'astro' cannot be combined yet: use one common process.")
+            if astro_flow is None:
+                raise ValueError("an 'astro' block needs a trained flow (astro_flow).")
+            # Imported here: AstroGWB needs the [astro] extra (flax)
+            from ATLAS.signals.correlated.astro_gwb import AstroGWB
+            signals.append(AstroGWB(
+                data=self.data,
+                flow=astro_flow,
+                name='astro',
+                lower_bound_psd=gwb_lower_bound_psd,
+                upper_bound_psd=gwb_upper_bound_psd,
+                astro_lower=astro_lower_bound,
+                astro_upper=astro_upper_bound,
+                astro_log_prior=astro_log_prior,
+                fixed_astro=fixed_astro,
             ))
 
         if 'dm' in red_signal_names:

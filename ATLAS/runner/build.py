@@ -59,6 +59,68 @@ def _wn_overrides(run, wn):
                 setattr(cov, lo_attr, float(lo)); setattr(cov, hi_attr, float(hi))
 
 
+def _load_astro_flow(run):
+    """The ``astro`` flow: a flow directory (Atlas or ng20), or a Pandora pickle + mapping."""
+    from ATLAS.astro.flows import load_astro_flow
+    from ATLAS.runner.config import resolve_path
+    a = run["model"]["signals"]["astro"]
+    if a["mapping"] is not None:
+        return load_astro_flow(pickle=resolve_path(run, a["pickle"]),
+                               mapping=resolve_path(run, a["mapping"]))
+    # an ng20 pickle name is relative to the flow directory
+    return load_astro_flow(resolve_path(run, a["flow"]), pickle=a["pickle"])
+
+
+def _astro_kwargs(run, res, flow):
+    """``make_red_noise`` keywords of the ``astro`` block.
+
+    ``res`` is ``resolved['astro']`` from ``validate_run``.  Bounds not in the
+    priors entry stay at the flow's training range.
+    """
+    from ATLAS.runner.config import load_function
+    a = run["model"]["signals"]["astro"]
+    names = list(flow.metadata.get("param_names") or
+                 [f"theta_{i}" for i in range(flow.n_params)])
+    unknown = sorted(set(res["theta"]) | set(res["fixed"]))
+    unknown = [n for n in unknown if n not in names]
+    if unknown:
+        raise ConfigError(f"model.signals.astro: {unknown} are not flow parameters {names}")
+    n_f = int(len(flow.mean_gwb))
+    kw = dict(astro_flow=flow, fixed_astro=dict(res["fixed"]) or None)
+
+    rho = res["rho"]
+    if rho is not None:
+        pairs = np.asarray([rho] * n_f if np.ndim(rho) == 1 else rho, dtype=np.float64)
+        if pairs.shape != (n_f, 2):
+            raise ConfigError(f"model.signals.astro: {len(pairs)} halflog10_rho bounds for the "
+                              f"flow's {n_f} bins")
+        kw["gwb_upper_bound_psd"] = pairs[:, 1]
+        if flow.metadata.get("zero_handling") == "offset":
+            # as in run_pandora: the box starts at the zero slab, so only upper edges apply
+            log.info("offset-mode flow: the halflog10_rho lower edges are ignored (the box "
+                     "starts at the zero slab)")
+        else:
+            kw["gwb_lower_bound_psd"] = pairs[:, 0]
+    if res["theta"]:
+        # full-length boxes at the training range, named overrides on top
+        lo = np.asarray(flow.mean_ast - flow.half_range_ast, dtype=np.float64).copy()
+        hi = np.asarray(flow.mean_ast + flow.half_range_ast, dtype=np.float64).copy()
+        for n, (l, h) in res["theta"].items():
+            lo[names.index(n)], hi[names.index(n)] = l, h
+        kw["astro_lower_bound"], kw["astro_upper_bound"] = lo, hi
+
+    if res["log_prior"] == "pspace":
+        from ATLAS.astro.priors import pspace_log_prior
+        pspace = a["pspace"] or flow.metadata.get("param_space")
+        if pspace is None:
+            raise ConfigError("model.signals.astro.log_prior: pspace needs model.signals.astro.pspace: "
+                              "this flow does not record its parameter space")
+        kw["astro_log_prior"] = pspace_log_prior(pspace, names)
+    elif res["log_prior"] is not None:
+        kw["astro_log_prior"] = load_function(run, res["log_prior"])
+    return kw
+
+
 def build_model(run, parsed, resolved):
     """Everything ``model_maker`` needs for one run.
 
@@ -111,6 +173,13 @@ def build_model(run, parsed, resolved):
         psr_dists_dict=data_io.load_distances(run),
         parfiles=parfiles, timfiles=timfiles,
     )
+    astro_flow = None
+    if "astro" in present:
+        # the flow fixes the GWB frequencies: every Fourier basis uses its Tspan
+        from ATLAS.signals.correlated.astro_gwb import set_flow_tspan
+        astro_flow = _load_astro_flow(run)
+        a = sig["astro"]
+        set_flow_tspan(data, astro_flow, policy=a["tspan_policy"], rtol=float(a["tspan_rtol"]))
     mb = ModelBuilder(data=data)
 
     wn_cfg = run["white_noise"]
@@ -140,6 +209,8 @@ def build_model(run, parsed, resolved):
         if resolved["cor"]["orf_names"]:
             kw["lower_bound_orf"] = jnp.asarray(resolved["cor"]["orf_lower"])
             kw["upper_bound_orf"] = jnp.asarray(resolved["cor"]["orf_upper"])
+    if "astro" in present:
+        kw.update(_astro_kwargs(run, resolved["astro"], astro_flow))
     if "dm" in present:
         kw["dm_psd_function"], kw["dm_lower_bound_psd"], kw["dm_upper_bound_psd"] = psd_of("dm")
     if "chrom" in present or "cquad" in present:
